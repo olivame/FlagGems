@@ -112,10 +112,72 @@ def _is_shape_bucketing_active(obj: Any = None) -> bool:
     except AttributeError:
         return False
 
+
+def _is_xpu_static_grid_backend() -> bool:
+    """Return True when the active backend bakes non-callable launch grids into xpubin."""
+    if os.environ.get("FLAGTREE_BACKEND", "").lower() == "xpu":
+        return True
+    if os.environ.get("TRITON_BACKEND", "").lower() == "xpu":
+        return True
+    vendor_mod = getattr(_state, "vendor_module", None)
+    vendor_info = getattr(vendor_mod, "vendor_info", None)
+    return getattr(vendor_info, "vendor_name", "") == "kunlunxin"
+
+
+def _canonicalize_static_grid(grid: Any) -> Tuple[Any, ...]:
+    try:
+        return tuple(int(x) for x in grid)
+    except Exception:
+        return (grid,) if not isinstance(grid, (tuple, list)) else tuple(grid)
+
+from types import SimpleNamespace
+
 from flag_gems import runtime
-from flag_gems.flagtune.inference import cost_model
-from flag_gems.runtime import device, torch_device_fn
-from flag_gems.runtime.backend import _state
+from flag_gems.runtime import torch_device_fn
+
+device = getattr(runtime, "device", None)
+if not hasattr(runtime, "TuningMode"):
+
+    class _CompatTuningMode(str, Enum):
+        DEFAULT = "default"
+        EXPANDED = "expanded"
+        COST_MODEL = "cost_model"
+
+    runtime.TuningMode = _CompatTuningMode
+if not hasattr(runtime, "CostModelIntent"):
+
+    class _CompatCostModelIntent(str, Enum):
+        AUTO = "auto"
+        REQUIRED = "required"
+        DISABLED = "disabled"
+
+    runtime.CostModelIntent = _CompatCostModelIntent
+if not hasattr(runtime, "resolve_cost_model_intent"):
+    runtime.resolve_cost_model_intent = (
+        lambda **kw: runtime.CostModelIntent.DISABLED
+    )
+if not hasattr(runtime, "resolve_tuning_mode"):
+    runtime.resolve_tuning_mode = (
+        lambda *a, **kw: runtime.TuningMode.DEFAULT
+    )
+
+try:
+    from flag_gems.flagtune.inference import cost_model
+except ImportError:
+    cost_model = SimpleNamespace(
+        _COST_MODEL_DISABLED_OPS=set(),
+        failure_key=lambda *a, **kw: (),
+        auto_failure_state=lambda *a, **kw: (False, False),
+        is_auto_disabled=lambda *a, **kw: False,
+    )
+
+try:
+    from flag_gems.runtime.backend import _state
+except ImportError:
+    from flag_gems.runtime.backend import vendor_module as _vendor_module
+
+    _state = SimpleNamespace(vendor_module=_vendor_module)
+
 from flag_gems.utils.code_cache import config_cache_dir
 from flag_gems.utils.models import PersistantModel, SQLPersistantModel
 
@@ -1636,7 +1698,10 @@ class LibEntry(triton.KernelInterface):
         return tuple(tuners)
 
     def _apply_flagtune(self, device=None, args=(), kwargs=None):
-        from flag_gems.runtime.flagtune import _flagtune_state_key
+        try:
+            from flag_gems.runtime.flagtune import _flagtune_state_key
+        except ImportError:
+            _flagtune_state_key = lambda: None
 
         if device is None:
             device = torch_device_fn.current_device()
@@ -1930,6 +1995,8 @@ class LibEntry(triton.KernelInterface):
             self._normalize_spec_and_heur_for_key(
                 spec_names, spec_args, const_args, all_named_args
             )
+            if not callable(grid) and _is_xpu_static_grid_backend():
+                const_args.append(("xpu_baked_grid", _canonicalize_static_grid(grid)))
 
         entry_key = self.key(spec_args, dns_args, const_args)
         # CPU has one device per process and `current_device()` returns the
@@ -2127,6 +2194,9 @@ class LibEntry(triton.KernelInterface):
             self._normalize_spec_and_heur_for_key(
                 spec_names, keys[1], keys[0], all_named_args
             )
+            raw_grid = kwargs.get("grid")
+            if raw_grid is not None and not callable(raw_grid) and _is_xpu_static_grid_backend():
+                keys[0].append(("xpu_baked_grid", _canonicalize_static_grid(raw_grid)))
         # Generic order is specialized, unspecialized, then constexpr values.
         entry_key = self.key(keys[1], keys[2], keys[0])
         device_index = torch_device_fn.current_device()

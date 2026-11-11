@@ -26,6 +26,13 @@ from types import SimpleNamespace
 
 def _bootstrap_test_env() -> None:
     """Ensure FlagGems + FlagTree import cleanly in both container and host-unit environments."""
+    try:
+        from triton._C.libtriton import getenv as _g  # noqa: F401
+        import flag_gems  # noqa: F401
+        return
+    except Exception:
+        pass
+
     fg_root = Path(__file__).resolve().parents[1]
     fg_src = fg_root / "src"
     if str(fg_src) not in sys.path:
@@ -171,11 +178,13 @@ def _bootstrap_test_env() -> None:
 
 _bootstrap_test_env()
 
+import importlib  # noqa: E402
 import torch  # noqa: E402
 import triton  # noqa: E402
-from flag_gems.utils import libentry as lib  # noqa: E402
 from triton.runtime.autotuner import Config  # noqa: E402
 from triton.runtime.jit import JITFunction  # noqa: E402
+
+lib = importlib.import_module("flag_gems.utils.libentry")
 
 
 def _make_tensor(dtype=None, aligned=True):
@@ -470,6 +479,47 @@ class TestLibEntryFlagTreeBucketing(unittest.TestCase):
             tuner.run(a_t, b_t, c_t, 4096, 4096, 1440, 1440, 4096, grid=(1,))
             self.assertEqual(tuner.last_dispatch_result.status.value, "GUARD_MISMATCH")
             self.assertEqual(tuner.best_config.kwargs["BLOCK_K"], 32)
+
+    def test_xpu_static_grid_baked_key_separation_vs_callable_grid_reuse(self):
+        row_src = """
+        def row_scale_kern(X, Y, M, N, BLOCK_N: tl.constexpr):
+            row = tl.program_id(0)
+            cols = tl.arange(0, BLOCK_N)
+            v = tl.load(X + row * N + cols, mask=cols < N)
+            tl.store(Y + row * N + cols, v, mask=cols < N)
+        """
+        x_t, y_t = _make_tensor(), _make_tensor()
+        prev_backend = os.environ.get("FLAGTREE_BACKEND")
+        os.environ["FLAGTREE_BACKEND"] = "xpu"
+        try:
+            with triton.knobs.autotuning.scope():
+                triton.knobs.autotuning.shape_bucketing = True
+                triton.knobs.autotuning.adjust_block_size = False
+
+                for cache_binding in (True, False):
+                    # Static tuple grids are baked into xpubin on XPU -> distinct cache keys
+                    jit_static = _FakeJIT(row_src)
+                    e_static = _build_synthetic_libentry(
+                        jit_static, jit_static, cache_binding=cache_binding
+                    )
+                    e_static.run(x_t, y_t, 277, 128, BLOCK_N=128, grid=(277, 1, 1))
+                    e_static.run(x_t, y_t, 277, 128, BLOCK_N=128, grid=(277, 1, 1))
+                    e_static.run(x_t, y_t, 291, 128, BLOCK_N=128, grid=(291, 1, 1))
+                    self.assertEqual(len(jit_static.compiled_kernels), 2)
+
+                    # Callable grids remain dynamic at launch on XPU -> bucket reuse across 277 & 291
+                    jit_dyn = _FakeJIT(row_src)
+                    e_dyn = _build_synthetic_libentry(
+                        jit_dyn, jit_dyn, cache_binding=cache_binding
+                    )
+                    e_dyn.run(x_t, y_t, 277, 128, BLOCK_N=128, grid=lambda m: (m["M"], 1, 1))
+                    e_dyn.run(x_t, y_t, 291, 128, BLOCK_N=128, grid=lambda m: (m["M"], 1, 1))
+                    self.assertEqual(len(jit_dyn.compiled_kernels), 1)
+        finally:
+            if prev_backend is None:
+                os.environ.pop("FLAGTREE_BACKEND", None)
+            else:
+                os.environ["FLAGTREE_BACKEND"] = prev_backend
 
 
 if __name__ == "__main__":
