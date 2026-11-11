@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import inspect
+import json
 import logging
 import math
 import multiprocessing
@@ -82,6 +83,34 @@ try:
     _HAS_FLAGTREE_AABS = hasattr(triton.knobs.autotuning, "adjust_block_size")
 except AttributeError:
     _HAS_FLAGTREE_AABS = False
+
+try:
+    _HAS_FLAGTREE_SHAPE_BUCKETING = hasattr(
+        triton.knobs.autotuning, "shape_bucketing"
+    )
+except AttributeError:
+    _HAS_FLAGTREE_SHAPE_BUCKETING = False
+
+
+class _NormalizedSpecScalar:
+    """Wrapper carrying a pre-normalized specialization tuple into LibEntry.key."""
+
+    __slots__ = ("token",)
+
+    def __init__(self, token: Tuple[Any, ...]) -> None:
+        self.token = token
+
+
+def _is_shape_bucketing_active(obj: Any = None) -> bool:
+    """Return True when FlagTree shape bucketing is available and enabled."""
+    if not _HAS_FLAGTREE_SHAPE_BUCKETING:
+        return False
+    if obj is not None and getattr(obj, "shape_policy", None) is not None:
+        return True
+    try:
+        return bool(triton.knobs.autotuning.shape_bucketing)
+    except AttributeError:
+        return False
 
 from flag_gems import runtime
 from flag_gems.flagtune.inference import cost_model
@@ -679,7 +708,24 @@ class LibTuner(triton.runtime.Autotuner):
         ).hexdigest()[:32]
 
     def get_key(self, args):
-        """Return the strategy-normalized key used only by ConfigCache."""
+        """Return the strategy-normalized (or FlagTree bucketed) key used only by ConfigCache."""
+        if _is_shape_bucketing_active(self):
+            from triton.runtime.shape_bucketing import resolve_tuner_policy
+
+            policy = resolve_tuner_policy(
+                self,
+                explicit_policy=getattr(self, "shape_policy", None),
+                policy_path=triton.knobs.autotuning.shape_policy_path,
+                mode_str=triton.knobs.autotuning.shape_bucketing_mode,
+            )
+            extra_dtypes = tuple(
+                str(dtype) for dtype in _infer_tensor_dtypes(args.values())
+            )
+            lookup = policy.lookup_autotune_key(
+                args, self.keys, extra_dtypes=extra_dtypes
+            )
+            self._last_bucket_lookup = lookup
+            return (json.dumps(lookup.bucket_key, separators=(",", ":")),)
         if self.strategy is None:
             key = tuple(args[k] for k in self.keys if k in args)
         else:
@@ -1041,9 +1087,33 @@ class LibTuner(triton.runtime.Autotuner):
         if len(self.configs) > 1 or bypass_config_cache or cost_model_mode:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for k, v in all_args.items() if k in self.arg_names}
+            bucketing_active = _is_shape_bucketing_active(self)
+            config_cache_store = (
+                libcache[f"{self.config_table_name}_sbkt_v1"]
+                if (bucketing_active and isinstance(self.cache, ConfigCache))
+                else self.cache
+            )
             config_key = self.get_key(_args)
             benchmark_key = self.get_benchmark_key(_args)
-            if bypass_config_cache or config_key not in self.cache:
+            guard_mismatch = False
+            if (
+                bucketing_active
+                and not bypass_config_cache
+                and config_key in config_cache_store
+                and self.early_config_prune is not None
+            ):
+                cached_candidate = config_cache_store[config_key]
+                if not self.early_config_prune([cached_candidate], self.nargs, **kwargs):
+                    guard_mismatch = True
+                    exact_guard = [
+                        _args[k]
+                        for k in self.keys
+                        if k in _args and isinstance(_args[k], (int, str, float, bool))
+                    ]
+                    config_key = (
+                        f"{config_key[0]}::guard:{json.dumps(exact_guard, separators=(',', ':'))}",
+                    )
+            if bypass_config_cache or config_key not in config_cache_store:
                 cache: BenchmarkCache = libcache[
                     self.benchmark_table_name, benchmark_key
                 ]
@@ -1109,8 +1179,8 @@ class LibTuner(triton.runtime.Autotuner):
                 config = best_config
                 if not bypass_config_cache:
                     if self._flagtune_fallback_cache is None:
-                        self.cache[config_key] = best_config
-                        config = self.cache[config_key]
+                        config_cache_store[config_key] = best_config
+                        config = config_cache_store[config_key]
                     else:
                         fallback_cache, fallback_key = self._flagtune_fallback_cache
                         fallback_cache[fallback_key] = best_config
@@ -1122,7 +1192,41 @@ class LibTuner(triton.runtime.Autotuner):
                 self.pre_hook(full_nargs, reset_only=True)
                 self.configs_timings = timings
             else:
-                config = self.cache[config_key]
+                config = config_cache_store[config_key]
+            if bucketing_active:
+                lookup = getattr(self, "_last_bucket_lookup", None)
+                if lookup is not None:
+                    from triton.runtime.shape_bucketing import (
+                        BucketLookupResult,
+                        DispatchStatus,
+                        GLOBAL_BUCKET_TELEMETRY,
+                    )
+
+                    if guard_mismatch:
+                        eff_status = DispatchStatus.GUARD_MISMATCH
+                    elif lookup.status in (
+                        DispatchStatus.UNDERFLOW,
+                        DispatchStatus.OVERFLOW,
+                        DispatchStatus.GUARD_MISMATCH,
+                    ):
+                        eff_status = lookup.status
+                    elif not used_cached_result:
+                        eff_status = DispatchStatus.COLD_TUNED
+                    else:
+                        eff_status = DispatchStatus.HIT
+                    self.last_dispatch_result = BucketLookupResult(
+                        bucket_key=lookup.bucket_key,
+                        status=eff_status,
+                        representative_dims=lookup.representative_dims,
+                        raw_dims=lookup.raw_dims,
+                        clamped_axes=lookup.clamped_axes,
+                    )
+                    GLOBAL_BUCKET_TELEMETRY.record(
+                        self.base_fn.__name__,
+                        eff_status,
+                        benchmark_key,
+                        lookup.bucket_key,
+                    )
             if config.pre_hook is None:
                 cached_kwargs = config.all_kwargs()
                 for original_config in self.configs:
@@ -1603,8 +1707,100 @@ class LibEntry(triton.KernelInterface):
                     plans.clear()
             self._flagtune_state = state
 
+    def _get_bucketing_meta(self):
+        """Lazily resolve and cache (policy, autotune_keys, heuristics_nodes) for LibEntry."""
+        from triton.runtime.shape_bucketing import OnlineBucketPolicy, resolve_tuner_policy
+
+        mode_str = triton.knobs.autotuning.shape_bucketing_mode
+        pol_path = triton.knobs.autotuning.shape_policy_path
+        divisibility = getattr(self, "divisibility", 16)
+        explicit_pol = getattr(self, "shape_policy", None)
+        cache_slot = (mode_str, pol_path, divisibility, id(explicit_pol))
+        meta_cache = getattr(self, "_ft_entry_bucket_meta", None)
+        if isinstance(meta_cache, dict) and cache_slot in meta_cache:
+            return meta_cache[cache_slot]
+
+        autotuner_node = None
+        heuristics_nodes = []
+        cur = getattr(self, "fn", None)
+        seen = set()
+        while cur is not None and id(cur) not in seen:
+            seen.add(id(cur))
+            if isinstance(cur, triton.runtime.Autotuner) and autotuner_node is None:
+                autotuner_node = cur
+            elif isinstance(cur, triton.runtime.Heuristics):
+                heuristics_nodes.append(cur)
+            if isinstance(cur, triton.runtime.JITFunction):
+                break
+            cur = getattr(cur, "fn", None)
+
+        target = autotuner_node or getattr(self, "jit_function", None) or getattr(self, "fn", None)
+        if target is not None and (
+            hasattr(target, "parse") or hasattr(target, "fn") or callable(target)
+        ):
+            policy = resolve_tuner_policy(
+                target,
+                explicit_policy=explicit_pol,
+                policy_path=pol_path,
+                mode_str=mode_str,
+                divisibility=divisibility,
+            )
+        else:
+            policy = explicit_pol or OnlineBucketPolicy(divisibility=divisibility)
+
+        autotune_keys = (
+            frozenset(getattr(autotuner_node, "keys", ()) or ())
+            if autotuner_node is not None
+            else frozenset()
+        )
+        resolved = (policy, autotune_keys, tuple(heuristics_nodes))
+        if not isinstance(meta_cache, dict):
+            meta_cache = {}
+            self._ft_entry_bucket_meta = meta_cache
+        meta_cache[cache_slot] = resolved
+        return resolved
+
+    def _normalize_spec_and_heur_for_key(
+        self,
+        spec_names,
+        spec_args,
+        const_args,
+        all_named_args,
+    ):
+        """Normalize specialized int scalars and pre-evaluate heuristics when bucketing is on."""
+        policy, autotune_keys, heuristics_nodes = self._get_bucketing_meta()
+        heur_failed = False
+        if heuristics_nodes:
+            heur_items = []
+            merged_env = dict(all_named_args)
+            try:
+                for h_node in reversed(heuristics_nodes):
+                    for h_k, h_fn in h_node.values.items():
+                        h_val = h_fn(merged_env)
+                        merged_env[h_k] = h_val
+                        heur_items.append((h_k, h_val))
+            except Exception:
+                heur_failed = True
+            else:
+                if heur_items:
+                    const_args.append(("ft_heur",) + tuple(heur_items))
+
+        for idx, (pname, val) in enumerate(zip(spec_names, spec_args)):
+            if type(val) is int:
+                treat_as_tuned = (pname in autotune_keys) or heur_failed
+                spec_args[idx] = _NormalizedSpecScalar(
+                    policy.normalize_entry_scalar(
+                        pname,
+                        val,
+                        is_autotuned_key=treat_as_tuned,
+                        all_args=all_named_args,
+                    )
+                )
+
     def key(self, spec_args, dns_args, const_args):
         def spec_arg(arg):
+            if isinstance(arg, _NormalizedSpecScalar):
+                return arg.token
             if hasattr(arg, "data_ptr"):
                 base = (arg.dtype, arg.data_ptr() % self.divisibility == 0)
                 if self._tensor_spec_fn is not None:
@@ -1686,6 +1882,7 @@ class LibEntry(triton.KernelInterface):
 
         # collect all the arguments
         spec_args = []  # specialize arguments
+        spec_names = []
         dns_args = []  # do not specialize arguments
         const_args = []  # constexpr arguments
         k_args = OrderedDict()
@@ -1694,6 +1891,7 @@ class LibEntry(triton.KernelInterface):
             if i in self.specialize_indices:
                 k_args[param_names[i]] = arg
                 spec_args.append(arg)
+                spec_names.append(param_names[i])
             elif i in self.do_not_specialize_indices:
                 k_args[param_names[i]] = arg
                 dns_args.append(arg)
@@ -1718,12 +1916,19 @@ class LibEntry(triton.KernelInterface):
                 k_args[p.name] = val
             else:
                 spec_args.append(val)
+                spec_names.append(p.name)
                 k_args[p.name] = val
 
         if self._has_flagtune_tuner:
             flagtune_dtypes = _infer_tensor_dtypes(k_args.values())
             const_args.append(
                 ("flagtune_dtypes",) + tuple(str(value) for value in flagtune_dtypes)
+            )
+
+        if _is_shape_bucketing_active(self):
+            all_named_args = {**dict(zip(param_names, args)), **kwargs, **k_args}
+            self._normalize_spec_and_heur_for_key(
+                spec_names, spec_args, const_args, all_named_args
             )
 
         entry_key = self.key(spec_args, dns_args, const_args)
@@ -1863,8 +2068,11 @@ class LibEntry(triton.KernelInterface):
         if count > len(self._binding_param_names):
             return None
         keys = ([], [], [])
+        spec_names = []
         dtype_names = []
-        for kind, value in zip(self._binding_param_kinds, args):
+        for pname, kind, value in zip(
+            self._binding_param_names, self._binding_param_kinds, args
+        ):
             if not (
                 isinstance(value, self._binding_tensor_type)
                 or type(value) in self._binding_scalar_types
@@ -1873,6 +2081,8 @@ class LibEntry(triton.KernelInterface):
             if kind == 0 and isinstance(value, self._binding_tensor_type):
                 return None
             keys[kind].append(value)
+            if kind == 1:
+                spec_names.append(pname)
             if self._has_flagtune_tuner and isinstance(
                 value, self._binding_tensor_type
             ):
@@ -1897,6 +2107,8 @@ class LibEntry(triton.KernelInterface):
             if kind == 0 and isinstance(value, self._binding_tensor_type):
                 return None
             keys[kind].append(value)
+            if kind == 1:
+                spec_names.append(name)
             if self._has_flagtune_tuner and isinstance(
                 value, self._binding_tensor_type
             ):
@@ -1907,6 +2119,14 @@ class LibEntry(triton.KernelInterface):
                 dtype_names.append(name)
         if self._has_flagtune_tuner:
             keys[0].append(("flagtune_dtypes",) + tuple(dtype_names))
+        if _is_shape_bucketing_active(self):
+            all_named_args = {
+                **dict(zip(self._binding_param_names, args)),
+                **kwargs,
+            }
+            self._normalize_spec_and_heur_for_key(
+                spec_names, keys[1], keys[0], all_named_args
+            )
         # Generic order is specialized, unspecialized, then constexpr values.
         entry_key = self.key(keys[1], keys[2], keys[0])
         device_index = torch_device_fn.current_device()
