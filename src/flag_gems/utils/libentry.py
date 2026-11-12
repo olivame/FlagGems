@@ -1818,12 +1818,40 @@ class LibEntry(triton.KernelInterface):
             if autotuner_node is not None
             else frozenset()
         )
+        self._ft_autotuner_node = autotuner_node
         resolved = (policy, autotune_keys, tuple(heuristics_nodes))
         if not isinstance(meta_cache, dict):
             meta_cache = {}
             self._ft_entry_bucket_meta = meta_cache
         meta_cache[cache_slot] = resolved
         return resolved
+
+    def _record_autotuner_entry_hit(self, all_named_args):
+        """Record a HIT in GLOBAL_BUCKET_TELEMETRY when LibEntry's outer cache bypasses an active Autotuner."""
+        policy, _, _ = self._get_bucketing_meta()
+        tuner = getattr(self, "_ft_autotuner_node", None)
+        if tuner is None:
+            return
+        has_dyn_gen = bool(
+            getattr(tuner, "no_configs", False)
+            and getattr(tuner, "generate_configs", None) is not None
+        )
+        if len(getattr(tuner, "configs", ()) or ()) <= 1 and not has_dyn_gen:
+            return
+        try:
+            from triton.runtime.shape_bucketing import DispatchStatus, GLOBAL_BUCKET_TELEMETRY
+
+            t_arg_names = getattr(tuner, "arg_names", ())
+            _args = {k: all_named_args[k] for k in t_arg_names if k in all_named_args}
+            t_keys = getattr(tuner, "keys", ())
+            raw_key = [_args[k] for k in t_keys if k in _args]
+            extra_dtypes = [str(v.dtype) for v in _args.values() if hasattr(v, "dtype")]
+            raw_key.extend(extra_dtypes)
+            lookup = policy.lookup_autotune_key(_args, t_keys, extra_dtypes=extra_dtypes)
+            fn_name = getattr(getattr(tuner, "base_fn", None), "__name__", self.jit_function.__name__)
+            GLOBAL_BUCKET_TELEMETRY.record(fn_name, DispatchStatus.HIT, tuple(raw_key), lookup.bucket_key)
+        except Exception:
+            pass
 
     def _normalize_spec_and_heur_for_key(
         self,
@@ -1990,7 +2018,9 @@ class LibEntry(triton.KernelInterface):
                 ("flagtune_dtypes",) + tuple(str(value) for value in flagtune_dtypes)
             )
 
-        if _is_shape_bucketing_active(self):
+        bucketing_active = _is_shape_bucketing_active(self)
+        all_named_args = None
+        if bucketing_active:
             all_named_args = {**dict(zip(param_names, args)), **kwargs, **k_args}
             self._normalize_spec_and_heur_for_key(
                 spec_names, spec_args, const_args, all_named_args
@@ -2060,6 +2090,9 @@ class LibEntry(triton.KernelInterface):
                     tuple(launch_pre_hooks),
                 )
             return kernel, constexprs
+
+        if bucketing_active and all_named_args is not None:
+            self._record_autotuner_entry_hit(all_named_args)
 
         (
             kernel,
@@ -2186,7 +2219,9 @@ class LibEntry(triton.KernelInterface):
                 dtype_names.append(name)
         if self._has_flagtune_tuner:
             keys[0].append(("flagtune_dtypes",) + tuple(dtype_names))
-        if _is_shape_bucketing_active(self):
+        bucketing_active = _is_shape_bucketing_active(self)
+        all_named_args = None
+        if bucketing_active:
             all_named_args = {
                 **dict(zip(self._binding_param_names, args)),
                 **kwargs,
@@ -2210,6 +2245,8 @@ class LibEntry(triton.KernelInterface):
         entry = cache.get(entry_key)
         if entry is None:
             return None
+        if bucketing_active and all_named_args is not None:
+            self._record_autotuner_entry_hit(all_named_args)
         kernel, constexprs, tune_constexprs, heur_constexprs, hooks = entry
         plan_key = (device_index, entry_key, count)
         saved = self._launch_plans.get(plan_key)
