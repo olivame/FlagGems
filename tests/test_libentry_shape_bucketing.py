@@ -521,6 +521,54 @@ class TestLibEntryFlagTreeBucketing(unittest.TestCase):
             else:
                 os.environ["FLAGTREE_BACKEND"] = prev_backend
 
+    def test_post_tuner_heuristics_tile_alignment_subkey(self):
+        mm_src = """
+        def mm_tile_kern(A, B, C, M, N, K, BLOCK_M: tl.constexpr, FULL_M: tl.constexpr):
+            rm = tl.arange(0, BLOCK_M)
+            if FULL_M:
+                a = tl.load(A + rm)
+            else:
+                a = tl.load(A + rm, mask=rm < M, other=0.0)
+            tl.store(C + rm, a)
+        """
+        jit_fn = _FakeJIT(mm_src)
+        heur = triton.runtime.Heuristics(
+            jit_fn,
+            jit_fn.arg_names,
+            {"FULL_M": lambda a: (int(a["M"]) % int(a["BLOCK_M"])) == 0},
+        )
+        tuner = lib.LibTuner.get("default")(
+            heur,
+            jit_fn.arg_names,
+            [Config({"BLOCK_M": 128}), Config({"BLOCK_M": 64})],
+            ["M", "N", "K"],
+            reset_to_zero=None,
+            restore_value=None,
+            do_bench=lambda fn_call, quantiles=None: [0.05, 0.04, 0.06],
+        )
+        tuner.cache = {}
+        entry = _build_synthetic_libentry(tuner, jit_fn, cache_binding=True)
+        a_t, b_t, c_t = _make_tensor(), _make_tensor(), _make_tensor()
+
+        with triton.knobs.autotuning.scope():
+            triton.knobs.autotuning.shape_bucketing = True
+            triton.knobs.autotuning.shape_bucketing_mode = "inference"
+            triton.knobs.autotuning.adjust_block_size = False
+
+            # M=256 (aligned FULL_M=True) -> compiles kernel #1 with FULL_M=True
+            entry.run(a_t, b_t, c_t, 256, 128, 128, grid=(2,))
+            self.assertEqual(len(jit_fn.compiled_kernels), 1)
+            self.assertTrue(jit_fn.compiled_kernels[-1][2]["FULL_M"])
+
+            # M=240 (in same 256 bucket, but FULL_M=False) -> must NOT reuse unmasked FULL_M=True kernel!
+            entry.run(a_t, b_t, c_t, 240, 128, 128, grid=(2,))
+            self.assertEqual(len(jit_fn.compiled_kernels), 2)
+            self.assertFalse(jit_fn.compiled_kernels[-1][2]["FULL_M"])
+
+            # M=224 (same 256 bucket, also FULL_M=False) -> MUST hit masked kernel #2 without recompile!
+            entry.run(a_t, b_t, c_t, 224, 128, 128, grid=(2,))
+            self.assertEqual(len(jit_fn.compiled_kernels), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

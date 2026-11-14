@@ -164,12 +164,16 @@ if not hasattr(runtime, "resolve_tuning_mode"):
 try:
     from flag_gems.flagtune.inference import cost_model
 except ImportError:
-    cost_model = SimpleNamespace(
-        _COST_MODEL_DISABLED_OPS=set(),
-        failure_key=lambda *a, **kw: (),
-        auto_failure_state=lambda *a, **kw: (False, False),
-        is_auto_disabled=lambda *a, **kw: False,
-    )
+    cost_model = SimpleNamespace()
+
+for _cm_attr, _cm_default in (
+    ("_COST_MODEL_DISABLED_OPS", set()),
+    ("failure_key", lambda *a, **kw: ()),
+    ("auto_failure_state", lambda *a, **kw: (False, False)),
+    ("is_auto_disabled", lambda *a, **kw: False),
+):
+    if not hasattr(cost_model, _cm_attr):
+        setattr(cost_model, _cm_attr, _cm_default)
 
 try:
     from flag_gems.runtime.backend import _state
@@ -788,7 +792,7 @@ class LibTuner(triton.runtime.Autotuner):
             )
             self._last_bucket_lookup = lookup
             return (json.dumps(lookup.bucket_key, separators=(",", ":")),)
-        if self.strategy is None:
+        if self.strategy is None or os.environ.get("FLAGTREE_DISABLE_TUNER_STRATEGY", "0") == "1":
             key = tuple(args[k] for k in self.keys if k in args)
         else:
             key = tuple(
@@ -1381,9 +1385,14 @@ def _flagtune_legacy_fallback(self, bench_fn, args, kwargs, op_name):
             key = self.get_key(
                 {k: v for k, v in arguments.items() if k in self.arg_names}
             )
-            self._flagtune_fallback_cache = (self.cache, key)
-            if key in self.cache:
-                cached = self.cache[key]
+            target_cache = (
+                libcache[f"{self.config_table_name}_sbkt_v1"]
+                if (_is_shape_bucketing_active(self) and isinstance(self.cache, ConfigCache))
+                else self.cache
+            )
+            self._flagtune_fallback_cache = (target_cache, key)
+            if key in target_cache:
+                cached = target_cache[key]
                 # Restore the live Config's hook and do not resurrect a cached
                 # candidate that the current shape's legality filter rejected.
                 for candidate in pruned:
@@ -1964,7 +1973,7 @@ class LibEntry(triton.KernelInterface):
             knobs_obj.adjust_block_size = previous
 
     def run(self, *args, **kwargs):
-        if self._cache_binding:
+        if self._cache_binding and not _is_shape_bucketing_active(self):
             cached = self._run_cached(args, kwargs)
             if cached is not None:
                 return cached
@@ -2037,6 +2046,24 @@ class LibEntry(triton.KernelInterface):
             cache = self._cpu_cache
         else:
             cache = self.kernel_cache[device]
+        if bucketing_active and all_named_args is not None and entry_key in cache:
+            _, _, cached_tune_constexprs, cached_heur_constexprs, _ = cache[entry_key]
+            _, _, heuristics_nodes = self._get_bucketing_meta()
+            if heuristics_nodes and cached_heur_constexprs:
+                actual_heur = {}
+                merged_post = {**all_named_args, **cached_tune_constexprs}
+                try:
+                    for h_node in reversed(heuristics_nodes):
+                        for h_k, h_fn in h_node.values.items():
+                            h_val = h_fn(merged_post)
+                            merged_post[h_k] = h_val
+                            actual_heur[h_k] = h_val
+                except Exception:
+                    actual_heur = cached_heur_constexprs
+                if actual_heur != cached_heur_constexprs:
+                    entry_key = entry_key + (
+                        ("ft_post_heur", tuple(sorted(actual_heur.items()))),
+                    )
         while entry_key not in cache:
             # NOTE: we serialize the first run of a jit function regardless of which device to run on
             # because Triton runtime is currently not threadsafe.
