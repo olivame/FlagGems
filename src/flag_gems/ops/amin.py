@@ -91,7 +91,7 @@ def amin_kernel(
     for off in range(0, N, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)[None, :]
         col_mask = cols < N
-        mask = row_mask and col_mask
+        mask = row_mask & col_mask
         a = tl.load(inp + cols, mask, other=max_value)
         _all = tl.minimum(_all, a)
     all = tl.min(_all, axis=1)[:, None]

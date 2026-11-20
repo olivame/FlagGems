@@ -139,8 +139,8 @@ def nll_loss_backward_scatter_kernel(
         total_w = 1.0
 
     inp_grad = tl.where(valid, -out_grad * wgt_tgt / total_w, 0.0)
-    inp_grad_ptrs = inp_grad_ptr + offsets_n * C + tgt
-    tl.store(inp_grad_ptrs, inp_grad, mask=mask_n)
+    inp_grad_ptrs = inp_grad_ptr + offsets_n.to(tl.int64) * C + tgt.to(tl.int64)
+    tl.store(inp_grad_ptrs, inp_grad, mask=valid)
 
 
 def nll_loss_backward(

@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
+
 logger = logging.getLogger(__name__)
 
 
@@ -99,19 +101,23 @@ def cat_copy_func_kernel_4(
         dim_offset = tl.cast(dim_offset_d, tl.int64)
         total_elements = tl.cast(total_elements_d, tl.int64)
 
-    block_start = pid_x * BLOCK_X
-    offsets = tl.arange(0, BLOCK_X)
-    mask = block_start + offsets < total_elements
-
+    block_start = tl.cast(pid_x, tl.int64) * BLOCK_X
+    offsets = tl.arange(0, BLOCK_X).to(tl.int64)
     idx = block_start + offsets
+    mask = idx < total_elements
 
-    pre_idx = idx // (dim_size_in * dim_prod_post)
-    dim_idx = (idx // dim_prod_post) % dim_size_in
-    post_idx = idx % dim_prod_post
+    dim_size_out_64 = tl.cast(dim_size_out, tl.int64)
+    dim_prod_post_64 = tl.cast(dim_prod_post, tl.int64)
+    safe_dim_size_in = tl.where(dim_size_in > 0, dim_size_in, 1)
+    safe_dim_prod_post = tl.where(dim_prod_post_64 > 0, dim_prod_post_64, 1)
+
+    pre_idx = idx // (safe_dim_size_in * safe_dim_prod_post)
+    dim_idx = (idx // safe_dim_prod_post) % safe_dim_size_in
+    post_idx = idx % safe_dim_prod_post
 
     out_idx = (
-        pre_idx * dim_size_out * dim_prod_post
-        + (dim_idx + dim_offset) * dim_prod_post
+        pre_idx * dim_size_out_64 * dim_prod_post_64
+        + (dim_idx + dim_offset) * dim_prod_post_64
         + post_idx
     )
 
@@ -125,84 +131,97 @@ def _cat_run_kernel(
     out_shape: List[int],
     out: torch.Tensor,
 ):
+    if out.numel() == 0:
+        return
+
+    # Filter out zero-element tensors (e.g. shape[dim] == 0) while tracking dim_offset
+    non_empty = []
+    running_offset = 0
+    for t in A:
+        dim_sz = t.shape[dim]
+        if t.numel() > 0:
+            non_empty.append((t, dim_sz, running_offset))
+        running_offset += dim_sz
+    if not non_empty:
+        return
+
     BLOCK = 1024
-    dim_offset = 0
-    i = 0
-    while i < len(A):
-        tensors_in_batch = A[i : i + 4]
-        num_tensors_in_batch = len(tensors_in_batch)
+    dim_size_out = out_shape[dim]
+    dim_prod_post = 1
+    for d in range(dim + 1, A[0].ndim):
+        dim_prod_post *= A[0].shape[d]
 
-        args = []
-        total_elements_list = []
-        current_dim_offset = dim_offset
+    with torch_device_fn.device(out.device):
+        i = 0
+        while i < len(non_empty):
+            batch = non_empty[i : i + 4]
+            num_tensors_in_batch = len(batch)
 
-        for j in range(4):
-            if j < num_tensors_in_batch:
-                tensor = tensors_in_batch[j].contiguous()
-                shape = tensor.shape
-                total_elements = tensor.numel()
-                dim_size_in = shape[dim]
+            args = []
+            total_elements_list = []
 
-                args.extend([tensor, dim_size_in, current_dim_offset, total_elements])
-                total_elements_list.append(total_elements)
-                current_dim_offset += dim_size_in
-            else:
-                args.extend([tensors_in_batch[0], 0, 0, 0])
-                total_elements_list.append(0)
+            for j in range(4):
+                if j < num_tensors_in_batch:
+                    raw_t, dim_size_in, cur_offset = batch[j]
+                    tensor = raw_t.contiguous()
+                    total_elements = tensor.numel()
 
-        dim_size_out = out_shape[dim]
-        dim_prod_post = 1
-        for d in range(dim + 1, A[0].ndim):
-            dim_prod_post *= A[0].shape[d]
+                    args.extend([tensor, dim_size_in, cur_offset, total_elements])
+                    total_elements_list.append(total_elements)
+                else:
+                    args.extend([args[0], 1, 0, 0])
+                    total_elements_list.append(0)
 
-        grid_y = num_tensors_in_batch
-        max_elements_in_batch = max(total_elements_list) if total_elements_list else 0
-        grid = (triton.cdiv(max_elements_in_batch, BLOCK), grid_y)
+            grid_y = num_tensors_in_batch
+            max_elements_in_batch = max(total_elements_list) if total_elements_list else 0
+            if max_elements_in_batch == 0:
+                i += num_tensors_in_batch
+                continue
+            grid = (triton.cdiv(max_elements_in_batch, BLOCK), grid_y)
 
-        (
-            tensor_a,
-            dim_size_in_a,
-            dim_offset_a,
-            total_elements_a,
-            tensor_b,
-            dim_size_in_b,
-            dim_offset_b,
-            total_elements_b,
-            tensor_c,
-            dim_size_in_c,
-            dim_offset_c,
-            total_elements_c,
-            tensor_d,
-            dim_size_in_d,
-            dim_offset_d,
-            total_elements_d,
-        ) = args
+            (
+                tensor_a,
+                dim_size_in_a,
+                dim_offset_a,
+                total_elements_a,
+                tensor_b,
+                dim_size_in_b,
+                dim_offset_b,
+                total_elements_b,
+                tensor_c,
+                dim_size_in_c,
+                dim_offset_c,
+                total_elements_c,
+                tensor_d,
+                dim_size_in_d,
+                dim_offset_d,
+                total_elements_d,
+            ) = args
 
-        cat_copy_func_kernel_4[grid](
-            out,
-            tensor_a,
-            tensor_b,
-            tensor_c,
-            tensor_d,
-            dim_size_in_a,
-            dim_size_in_b,
-            dim_size_in_c,
-            dim_size_in_d,
-            dim_size_out,
-            dim_prod_post,
-            dim_offset_a,
-            dim_offset_b,
-            dim_offset_c,
-            dim_offset_d,
-            total_elements_a,
-            total_elements_b,
-            total_elements_c,
-            total_elements_d,
-            BLOCK_X=BLOCK,
-        )
+            cat_copy_func_kernel_4[grid](
+                out,
+                tensor_a,
+                tensor_b,
+                tensor_c,
+                tensor_d,
+                dim_size_in_a,
+                dim_size_in_b,
+                dim_size_in_c,
+                dim_size_in_d,
+                dim_size_out,
+                dim_prod_post,
+                dim_offset_a,
+                dim_offset_b,
+                dim_offset_c,
+                dim_offset_d,
+                total_elements_a,
+                total_elements_b,
+                total_elements_c,
+                total_elements_d,
+                BLOCK_X=BLOCK,
+            )
 
-        dim_offset = current_dim_offset
-        i += num_tensors_in_batch
+            i += num_tensors_in_batch
 
 
 def _cat_build_working_list(
@@ -312,7 +331,12 @@ def cat_out(
         raise RuntimeError(f"cat.out: expected out dtype {dtype}, got {out.dtype}")
     if list(out.shape) != out_shape:
         out.resize_(out_shape)
-    _cat_run_kernel(A, dim, out_shape, out)
+    if out.is_contiguous():
+        _cat_run_kernel(A, dim, out_shape, out)
+    else:
+        buf = torch.empty(out_shape, dtype=dtype, device=device)
+        _cat_run_kernel(A, dim, out_shape, buf)
+        out.copy_(buf)
     return out
 
 
@@ -324,7 +348,7 @@ def cat(
     if _should_use_uint8_view_path(A):
         mode, payload, original_dtype = _cat_build_working_list_uint8_view(A, dim)
         if mode == "single":
-            return payload.view(original_dtype)
+            return payload.view(original_dtype).clone()
         if mode == "empty":
             return payload.view(original_dtype)
 
@@ -335,7 +359,7 @@ def cat(
 
     mode, payload = _cat_build_working_list(A, dim)
     if mode == "single":
-        return payload
+        return payload.clone()
     if mode == "empty":
         return payload
 

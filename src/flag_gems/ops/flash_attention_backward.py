@@ -74,6 +74,9 @@ def _parse_philox(
     philox_seed: torch.Tensor,
     philox_offset: torch.Tensor,
 ) -> Tuple[int, int]:
+    if philox_seed.numel() >= 2:
+        s = philox_seed.cpu()
+        return int(s[0].item()), int(s[1].item())
     return int(philox_seed.item()), int(philox_offset.item())
 
 
@@ -1414,10 +1417,7 @@ def scaled_dot_product_flash_attention_backward(
     is_dropout = dropout_p > 0.0
     rng_tuple = _parse_philox(philox_seed, philox_offset) if is_dropout else None
     use_varlen = (cum_seq_q is not None) and (cum_seq_k is not None)
-    # The opaque ATen entry and the flash backward kernels share the
-    # (B, S, H, D) layout; tensors pass straight through. The log-sum-exp
-    # arrives from the ATen forward in (B, H, S) already, so no transpose is
-    # needed either — only a varlen caller's cumulative-sequence path differs.
+    lse = logsumexp.float()
     if use_varlen:
         return flash_attn_backward(
             grad_out,
@@ -1425,7 +1425,7 @@ def scaled_dot_product_flash_attention_backward(
             key,
             value,
             out,
-            logsumexp,
+            lse,
             cu_seq_q=cum_seq_q,
             cu_seq_k=cum_seq_k,
             max_seqlen_q=int(max_q),
@@ -1436,13 +1436,15 @@ def scaled_dot_product_flash_attention_backward(
             is_causal=is_causal,
             softmax_scale=scale,
         )[:3]
-    dQ, dK, dV, _ = flash_attn_backward(
-        grad_out,
-        query,
-        key,
-        value,
-        out,
-        logsumexp,
+    # Dense ATen SDPA forward/backward expect (B, H, S, D), while flash_attn_backward
+    # operates on (B, S, H, D) with (B, H, S) logsumexp.
+    dQ_bshd, dK_bshd, dV_bshd, _ = flash_attn_backward(
+        grad_out.permute(0, 2, 1, 3).contiguous(),
+        query.permute(0, 2, 1, 3).contiguous(),
+        key.permute(0, 2, 1, 3).contiguous(),
+        value.permute(0, 2, 1, 3).contiguous(),
+        out.permute(0, 2, 1, 3).contiguous(),
+        lse,
         max_seqlen_q=int(max_q),
         max_seqlen_k=int(max_k),
         is_dropout=is_dropout,
@@ -1451,7 +1453,11 @@ def scaled_dot_product_flash_attention_backward(
         is_causal=is_causal,
         softmax_scale=scale,
     )
-    return dQ, dK, dV
+    return (
+        dQ_bshd.permute(0, 2, 1, 3).contiguous(),
+        dK_bshd.permute(0, 2, 1, 3).contiguous(),
+        dV_bshd.permute(0, 2, 1, 3).contiguous(),
+    )
 
 
 def scaled_dot_product_cudnn_attention_backward(

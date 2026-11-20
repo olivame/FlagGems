@@ -250,6 +250,18 @@ def generate_pad_kernel(
     # the decorators
     code.writeline("@libentry()")
     non_specialize_arg_names = ["value"]
+    if rank > 0:
+        for j in range(rank):
+            non_specialize_arg_names.extend(
+                [
+                    f"x_shape{j}",
+                    f"in_strides{j}",
+                    f"out_strides{j}",
+                    f"valid_dim{j}_start",
+                    f"valid_dim{j}_end",
+                ]
+            )
+        non_specialize_arg_names.extend(["in_elem_cnt", "out_elem_cnt"])
     code.writeline(f"@triton.jit(do_not_specialize={non_specialize_arg_names})")
 
     # signature
@@ -283,8 +295,8 @@ def generate_pad_kernel(
             for i in range(rank):
                 code.writeline(f"dim{i}_has_pad: tl.constexpr, ")
 
-            code.writeline("in_elem_cnt: tl.constexpr, ")
-            code.writeline("out_elem_cnt: tl.constexpr, ")
+            code.writeline("in_elem_cnt: int, ")
+            code.writeline("out_elem_cnt: int, ")
             code.writeline("value, # padding value")
             code.writeline("IS_CONSTANT: tl.constexpr, ")
             code.writeline("IS_REFLECT: tl.constexpr, ")

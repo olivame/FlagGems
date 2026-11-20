@@ -231,8 +231,23 @@ def try_get_optimal_moe_config(
             _, N, K = w1_shape
         else:
             _, N, K = w2_shape
+        effective_m = M
+        try:
+            if getattr(triton.knobs.autotuning, "shape_bucketing", False) and M > 0:
+                from triton.runtime.shape_bucketing import (
+                    BucketingMode,
+                    build_axis_ladder,
+                    geometric_bucket_ceil,
+                )
+
+                moe_mode = BucketingMode.parse(
+                    triton.knobs.autotuning.shape_bucketing_mode
+                )
+                effective_m = geometric_bucket_ceil(M, build_axis_ladder(mode=moe_mode))
+        except Exception:
+            effective_m = M
         config = get_default_config(
-            M,
+            effective_m,
             E,
             N,
             K,

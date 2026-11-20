@@ -20,15 +20,16 @@ import triton
 import triton.language as tl
 
 import flag_gems
+from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
 
 
 @triton.jit
 def _copy_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = block_start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offsets < n_elements
     x = tl.load(in_ptr + offsets, mask=mask)
     tl.store(out_ptr + offsets, x, mask=mask)
@@ -42,7 +43,6 @@ def lift_fresh(*args, **kwargs):
     is an independent allocation rather than an aliasing view.
     """
     logger.debug("GEMS LIFT_FRESH")
-    # Attempt to find the input tensor from args/kwargs
     x = None
     if len(args) > 0 and isinstance(args[0], torch.Tensor):
         x = args[0]
@@ -63,17 +63,15 @@ def lift_fresh(*args, **kwargs):
 
     x_contig = x.contiguous()
 
-    # Triton cannot canonicalize complex pointer types on some backends;
-    # clone() is a functionally equivalent copy that avoids the triton kernel.
     if x_contig.is_complex():
         return x_contig.clone()
 
     out = torch.empty_like(x_contig, memory_format=torch.contiguous_format)
 
     n_elements = x_contig.numel()
-    # BLOCK_SIZE=1024 mirrors the sibling lift_fresh_copy kernel; the op is a
-    # memory-bandwidth-bound copy, so a fixed block matches its performance.
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    _copy_kernel[grid](x_contig, out, n_elements, BLOCK_SIZE=1024)
+    if n_elements > 0:
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        with torch_device_fn.device(x_contig.device):
+            _copy_kernel[grid](x_contig, out, n_elements, BLOCK_SIZE=1024)
 
     return out.view_as(x_contig)

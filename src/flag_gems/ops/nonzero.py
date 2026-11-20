@@ -38,19 +38,19 @@ def nonzero_kernel(
     ndim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = ext.program_id(0)
+    pid = ext.program_id(0).to(tl.int64)
 
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = offset < n_elements
 
-    inp_vals = tl.load(inp + offset, mask=mask).to(tl.int1)
-    out_offset = tl.load(prefix_sum + offset, mask=mask) - 1
+    inp_vals = tl.load(inp + offset, mask=mask, other=0).to(tl.int1)
+    out_offset = tl.load(prefix_sum + offset, mask=mask, other=0).to(tl.int64) - 1
 
-    nonzero_mask = mask and inp_vals  # noqa
+    nonzero_mask = mask & inp_vals
 
     idx_flat = offset
     for dim in range(ndim - 1, -1, -1):
-        dim_size = tl.load(shape + dim)
+        dim_size = tl.load(shape + dim).to(tl.int64)
         remainder = idx_flat % dim_size
         idx_flat //= dim_size
         tl.store(out + out_offset * ndim + dim, remainder, mask=nonzero_mask)
@@ -60,30 +60,34 @@ def nonzero(inp, *, as_tuple=False):
     logger.debug("GEMS NONZERO")
 
     inp_ndim = inp.ndim
+    if inp_ndim == 0:
+        is_nz = bool((inp != 0).item())
+        if as_tuple:
+            if is_nz:
+                return (torch.zeros(1, dtype=torch.int64, device=inp.device),)
+            return (torch.empty(0, dtype=torch.int64, device=inp.device),)
+        return torch.empty((1 if is_nz else 0, 0), dtype=torch.int64, device=inp.device)
 
     inp = inp.contiguous()
     n_elements = inp.numel()
+    if n_elements == 0:
+        out = torch.empty((0, inp_ndim), dtype=torch.int64, device=inp.device)
+        return torch.unbind(out, dim=1) if as_tuple else out
+
     inp_view = inp.view(n_elements)
+    inp_bool = inp_view if inp_view.dtype == torch.bool else (inp_view != 0)
+    prefix_sum = inp_bool.to(torch.int64).cumsum(axis=0)
 
-    shape = torch.tensor(inp.shape, dtype=torch.int32, device=inp.device)
+    num_nonzeros = int(prefix_sum[n_elements - 1].item())
+    out = torch.empty((num_nonzeros, inp_ndim), dtype=torch.int64, device=inp.device)
 
-    inp_bool = inp_view
-    if inp_view.dtype != torch.bool:
-        inp_bool = inp_view != 0
-
-    prefix_sum = inp_bool.cumsum(axis=0)
-
-    num_nonzeros = n_elements
-    out = torch.empty(num_nonzeros, inp_ndim, dtype=torch.int64, device=inp.device)
-
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    with torch_device_fn.device(inp.device):
-        nonzero_kernel[grid](inp_bool, prefix_sum, out, n_elements, shape, inp_ndim)
-
-    num_nonzeros = prefix_sum[n_elements - 1].item()
-    out = out[0:num_nonzeros]
+    if num_nonzeros > 0:
+        shape = torch.tensor(inp.shape, dtype=torch.int64, device=inp.device)
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        with torch_device_fn.device(inp.device):
+            nonzero_kernel[grid](inp_bool, prefix_sum, out, n_elements, shape, inp_ndim)
 
     if as_tuple:
-        return torch.unbind(out, dim=0)
+        return torch.unbind(out, dim=1)
     else:
         return out

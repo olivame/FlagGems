@@ -93,6 +93,26 @@ def _full_n_tiles(args):
     return int(args["N"]) % int(args["BLOCK_N"]) == 0
 
 
+def _aligned_a_512x128(args):
+    return int(args["M"]) % 512 == 0 and int(args["K"]) % 128 == 0
+
+
+def _aligned_b_128x128(args):
+    return int(args["N"]) % 128 == 0 and int(args["K"]) % 128 == 0
+
+
+def _even_k_128(args):
+    return int(args["K"]) % 128 == 0
+
+
+def _even_m_512(args):
+    return int(args["M"]) % 512 == 0
+
+
+def _even_n_1024(args):
+    return int(args["N"]) % 1024 == 0
+
+
 def _ppu_bmm_configs():
     """Bounded PPU search covering narrow, balanced, and wide batched GEMMs."""
     specs = (
@@ -585,9 +605,14 @@ if HAS_PPU_TLE:
     )
     @triton.heuristics(
         values={
+            "ALIGNED_A_512X128": _aligned_a_512x128,
+            "ALIGNED_B_128X128": _aligned_b_128x128,
+            "EVEN_K": _even_k_128,
             "FULL_K_TILES": _full_k_tiles,
             "FULL_M_TILES": _full_m_tiles,
             "FULL_N_TILES": _full_n_tiles,
+            "EVEN_M": _even_m_512,
+            "EVEN_N": _even_n_1024,
         }
     )
     @triton.jit(do_not_specialize=["alpha", "beta"])
@@ -728,9 +753,14 @@ if HAS_PPU_TLE:
     )
     @triton.heuristics(
         values={
+            "ALIGNED_A_512X128": _aligned_a_512x128,
+            "ALIGNED_B_128X128": _aligned_b_128x128,
+            "EVEN_K": _even_k_128,
             "FULL_K_TILES": _full_k_tiles,
             "FULL_M_TILES": _full_m_tiles,
             "FULL_N_TILES": _full_n_tiles,
+            "EVEN_M": _even_m_512,
+            "EVEN_N": _even_n_1024,
         }
     )
     @triton.jit(do_not_specialize=["alpha", "beta"])
@@ -1623,11 +1653,6 @@ def _run_ppu_bmm_main(
                     gemm_bias.stride(2),
                     B_TRANSPOSED=b_transposed,
                     aiu_load_mask=_aiu_load_mask(A, b_chunk),
-                    ALIGNED_A_512X128=M % 512 == 0 and K % 128 == 0,
-                    ALIGNED_B_128X128=width % 128 == 0 and K % 128 == 0,
-                    EVEN_K=K % 128 == 0,
-                    EVEN_M=M % 512 == 0,
-                    EVEN_N=width % 1024 == 0,
                     FUSE_BIAS=fuse_bias and not separate_epilogue,
                     READ_BIAS=read_bias and not separate_epilogue,
                 )
@@ -1670,13 +1695,8 @@ def _run_ppu_bmm_main(
             bias.stride(2),
             B_TRANSPOSED=b_transposed,
             aiu_load_mask=_aiu_load_mask(A, B),
-            ALIGNED_A_512X128=M % 512 == 0 and K % 128 == 0,
-            ALIGNED_B_128X128=N % 128 == 0 and K % 128 == 0,
-            EVEN_K=K % 128 == 0,
-            EVEN_N=N % 1024 == 0,
             FUSE_BIAS=fuse_bias,
             READ_BIAS=read_bias,
-            EVEN_M=M % 512 == 0,
         )
     return out
 

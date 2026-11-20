@@ -24,6 +24,8 @@ import triton
 import triton.language as tl
 from triton.runtime import driver as _driver
 
+from flag_gems.runtime import torch_device_fn
+
 logger = logging.getLogger(__name__)
 
 _BLOCK = 1024
@@ -456,23 +458,24 @@ def greater_(self, other=None, **kwargs):
     logger.debug("GEMS_THEAD GREATER_")
     if other is None:
         other = kwargs["other"]
-    if isinstance(other, torch.Tensor):
-        if (
-            self.shape == other.shape
-            and self.dtype is other.dtype
-            and self.dtype is not torch.bool
-            and self.is_contiguous()
-            and other.is_contiguous()
-        ):
-            n = self.numel()
-            if n:
-                if n >= 262144:
-                    _launch(self, other, n, _k_flat_eq_big, 4096, 8)
-                else:
-                    _launch(self, other, n, _k_flat_eq, 1024, 4)
-            return self
-        return _run_tensor(self, other)
-    return _run_scalar(self, other)
+    with torch_device_fn.device(self.device):
+        if isinstance(other, torch.Tensor):
+            if (
+                self.shape == other.shape
+                and self.dtype is other.dtype
+                and self.dtype is not torch.bool
+                and self.is_contiguous()
+                and other.is_contiguous()
+            ):
+                n = self.numel()
+                if n:
+                    if n >= 262144:
+                        _launch(self, other, n, _k_flat_eq_big, 4096, 8)
+                    else:
+                        _launch(self, other, n, _k_flat_eq, 1024, 4)
+                return self
+            return _run_tensor(self, other)
+        return _run_scalar(self, other)
 
 
 _LC = {}

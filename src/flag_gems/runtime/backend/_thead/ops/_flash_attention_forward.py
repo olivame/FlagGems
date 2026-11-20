@@ -20,6 +20,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
+
 
 @triton.jit
 def _fa_fwd(
@@ -68,10 +70,12 @@ def _fa_fwd(
     DROPOUT_P: tl.constexpr,
     PV_DTYPE: tl.constexpr,
     SPLIT_D192: tl.constexpr,
+    GQA_GROUP: tl.constexpr = 1,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_h = tl.program_id(2)
+    pid_kv_h = pid_h // GQA_GROUP
 
     if VARLEN:
         q_start = tl.load(CuQ + pid_b)
@@ -85,8 +89,8 @@ def _fa_fwd(
         rv = SvB
         ro = SoB
         qbase = Q + pid_h * SqH
-        kbase = K + pid_h * SkH
-        vbase = V + pid_h * SvH
+        kbase = K + pid_kv_h * SkH
+        vbase = V + pid_kv_h * SvH
         obase = O + pid_h * SoH
         lse_base = LSE + pid_h * SlH
     else:
@@ -99,8 +103,8 @@ def _fa_fwd(
         rv = SvR
         ro = SoR
         qbase = Q + pid_b * SqB + pid_h * SqH
-        kbase = K + pid_b * SkB + pid_h * SkH
-        vbase = V + pid_b * SvB + pid_h * SvH
+        kbase = K + pid_b * SkB + pid_kv_h * SkH
+        vbase = V + pid_b * SvB + pid_kv_h * SvH
         obase = O + pid_b * SoB + pid_h * SoH
         lse_base = LSE + pid_b * SlB + pid_h * SlH
 
@@ -319,6 +323,7 @@ def _flash_attention_forward(
 
     if varlen:
         H, D = q.size(1), q.size(2)
+        H_kv = k.size(1)
         SqB, SqH, SqD = q.stride(0), q.stride(1), q.stride(2)
         SqR = SqB
         SkB, SkH, SkD = k.stride(0), k.stride(1), k.stride(2)
@@ -337,6 +342,7 @@ def _flash_attention_forward(
     else:
         if q.dim() == 4:
             B, S_q, H, D = q.shape
+            H_kv = k.size(2)
             SqB, SqR, SqH, SqD = q.stride(0), q.stride(1), q.stride(2), q.stride(3)
             SkB, SkR, SkH, SkD = k.stride(0), k.stride(1), k.stride(2), k.stride(3)
             SvB, SvR, SvH, SvD = v.stride(0), v.stride(1), v.stride(2), v.stride(3)
@@ -345,6 +351,7 @@ def _flash_attention_forward(
             B = 1
             S_q = q.size(0)
             H, D = q.size(1), q.size(2)
+            H_kv = k.size(1)
             SqB, SqR, SqH, SqD = 0, q.stride(0), q.stride(1), q.stride(2)
             SkB, SkR, SkH, SkD = 0, k.stride(0), k.stride(1), k.stride(2)
             SvB, SvR, SvH, SvD = 0, v.stride(0), v.stride(1), v.stride(2)
@@ -386,57 +393,60 @@ def _flash_attention_forward(
     alibi_ptr = alibi_slopes if alibi_slopes is not None else k
     seqused_ptr = seqused_k if seqused_k is not None else k
 
+    gqa_group = max(1, H // H_kv)
     grid = (triton.cdiv(max_q_int, BLOCK_M), batch, H)
 
-    _fa_fwd[grid](
-        q,
-        k,
-        v,
-        out,
-        lse,
-        cu_q,
-        cu_k,
-        seqused_ptr,
-        alibi_ptr,
-        scale_val,
-        SqB,
-        SqR,
-        SqH,
-        SqD,
-        SkB,
-        SkR,
-        SkH,
-        SkD,
-        SvB,
-        SvR,
-        SvH,
-        SvD,
-        SoB,
-        SoR,
-        SoH,
-        SoD,
-        SlB,
-        SlH,
-        SlR,
-        seq_q_u,
-        seq_k_u,
-        D,
-        wl,
-        wr,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_D=BLOCK_D,
-        VARLEN=varlen,
-        IS_CAUSAL=is_causal_b,
-        HAS_ALIBI=alibi_slopes is not None,
-        HAS_SEQUSED=seqused_k is not None,
-        DROPOUT=dropout_p_f > 0.0,
-        DROPOUT_P=dropout_p_f,
-        PV_DTYPE=tl.float16 if q.dtype == torch.float16 else tl.bfloat16,
-        SPLIT_D192=D == 192,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
+    with torch_device_fn.device(q.device):
+        _fa_fwd[grid](
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cu_q,
+            cu_k,
+            seqused_ptr,
+            alibi_ptr,
+            scale_val,
+            SqB,
+            SqR,
+            SqH,
+            SqD,
+            SkB,
+            SkR,
+            SkH,
+            SkD,
+            SvB,
+            SvR,
+            SvH,
+            SvD,
+            SoB,
+            SoR,
+            SoH,
+            SoD,
+            SlB,
+            SlH,
+            SlR,
+            seq_q_u,
+            seq_k_u,
+            D,
+            wl,
+            wr,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_D,
+            VARLEN=varlen,
+            IS_CAUSAL=is_causal_b,
+            HAS_ALIBI=alibi_slopes is not None,
+            HAS_SEQUSED=seqused_k is not None,
+            DROPOUT=dropout_p_f > 0.0,
+            DROPOUT_P=dropout_p_f,
+            PV_DTYPE=tl.float16 if q.dtype == torch.float16 else tl.bfloat16,
+            SPLIT_D192=D == 192,
+            GQA_GROUP=gqa_group,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
     seed = torch.zeros((), dtype=torch.int64, device=q.device)
     offset = torch.zeros((), dtype=torch.int64, device=q.device)
     debug_softmax = torch.empty(0, dtype=q.dtype, device=q.device)

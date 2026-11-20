@@ -167,8 +167,8 @@ def linear_backward(
     for dim in batch_dims:
         batch_size *= dim
 
-    input_flat = input.view(batch_size, in_features).contiguous()
-    grad_output_flat = grad_output.view(batch_size, out_features).contiguous()
+    input_flat = input.contiguous().view(batch_size, in_features)
+    grad_output_flat = grad_output.contiguous().view(batch_size, out_features)
 
     grad_input = None
     grad_weight = None

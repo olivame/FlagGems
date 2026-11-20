@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 
 from flag_gems import runtime
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as ext
 
@@ -37,7 +38,7 @@ def index_select_kernel(
     rows_mask = rows_offsets < M
     cols_offsets = pid_y * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    out_mask = rows_mask and (cols_offsets < index_len)
+    out_mask = rows_mask & (cols_offsets < index_len)
 
     indices = tl.load(index + cols_offsets, mask=(cols_offsets < index_len), other=0)
     valid_lower_bound = indices >= 0
@@ -75,7 +76,8 @@ def index_select(inp, dim, index):
         triton.cdiv(M, meta["BLOCK_M"]),
         triton.cdiv(index_len, meta["BLOCK_N"]),
     )
-    index_select_kernel[grid](inp, out, M, N, index, index_len)
+    with torch_device_fn.device(inp.device):
+        index_select_kernel[grid](inp, out, M, N, index, index_len)
     if dim != out.ndim - 1:
         order = [i for i in range(out.ndim - 1)]
         order.insert(dim, out.ndim - 1)

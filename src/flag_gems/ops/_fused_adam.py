@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as tle
 
@@ -26,87 +27,79 @@ logger = logging.getLogger(__name__)
 
 
 @libentry()
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "n",
+        "lr",
+        "beta1",
+        "beta2",
+        "weight_decay",
+        "eps",
+        "bias_correction1",
+        "bias_correction2",
+    ]
+)
 def _fused_adam_kernel(
     param,
     grad,
     exp_avg,
     exp_avg_sq,
     max_exp_avg_sq,
-    n: tl.constexpr,
+    n,
+    lr,
+    beta1,
+    beta2,
+    weight_decay,
+    eps,
+    bias_correction1,
+    bias_correction2,
+    HAS_WEIGHT_DECAY: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    lr: tl.constexpr,
-    beta1: tl.constexpr,
-    beta2: tl.constexpr,
-    weight_decay: tl.constexpr,
-    eps: tl.constexpr,
-    bias_correction1: tl.constexpr,
-    bias_correction2: tl.constexpr,
     amsgrad: tl.constexpr,
     maximize: tl.constexpr,
 ):
-    # Get the block/thread index
-    pid = tle.program_id(0)
-    # Calculate the starting offset for this block
-    param_offset = pid * BLOCK_SIZE
-    # Create a range of offsets for this block
-    offsets = param_offset + tl.arange(0, BLOCK_SIZE)
-    # Create a mask to avoid out-of-bounds access
+    pid = tle.program_id(0).to(tl.int64)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n
 
-    # Load parameters
-    # param: the model parameter
-    param_load = tl.load(param + offsets, mask=mask, other=0.0)
-    # grad: the gradient
-    grad_load = tl.load(grad + offsets, mask=mask, other=0.0)
+    param_load = tl.load(param + offsets, mask=mask, other=0.0).to(tl.float32)
+    grad_load = tl.load(grad + offsets, mask=mask, other=0.0).to(tl.float32)
 
-    # Handle maximize mode: grad = -grad if maximize is True
     if maximize:
         grad_load = -grad_load
+    if HAS_WEIGHT_DECAY:
+        grad_load = grad_load + weight_decay * param_load
 
-    # Load first moment estimate (exp_avg)
-    exp_avg_load = tl.load(exp_avg + offsets, mask=mask, other=0.0)
-    # Load second moment estimate (exp_avg_sq)
-    exp_avg_sq_load = tl.load(exp_avg_sq + offsets, mask=mask, other=0.0)
+    exp_avg_load = tl.load(exp_avg + offsets, mask=mask, other=0.0).to(tl.float32)
+    exp_avg_sq_load = tl.load(exp_avg_sq + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
 
-    # Update first moment estimate: m = beta1 * m + (1 - beta1) * g
-    exp_avg_new = beta1 * exp_avg_load + (1 - beta1) * grad_load
-    # Update second moment estimate: v = beta2 * v + (1 - beta2) * g^2
-    exp_avg_sq_new = beta2 * exp_avg_sq_load + (1 - beta2) * grad_load * grad_load
+    exp_avg_new = beta1 * exp_avg_load + (1.0 - beta1) * grad_load
+    exp_avg_sq_new = beta2 * exp_avg_sq_load + (1.0 - beta2) * grad_load * grad_load
 
-    # Apply bias correction
-    corrected_exp_avg = exp_avg_new / bias_correction1
-    corrected_exp_avg_sq = exp_avg_sq_new / bias_correction2
-
-    # Compute the denominator: sqrt(v_hat) + eps
     if amsgrad:
-        # Load max second moment estimate
-        max_exp_avg_sq_load = tl.load(max_exp_avg_sq + offsets, mask=mask, other=0.0)
-        # Update max: max_exp_avg_sq = max(max_exp_avg_sq, exp_avg_sq)
-        max_exp_avg_sq_new = tl.maximum(max_exp_avg_sq_load, corrected_exp_avg_sq)
-        # Store updated max
-        tl.store(max_exp_avg_sq + offsets, max_exp_avg_sq_new, mask=mask)
-        # Use max for denominator
-        denom = tl.sqrt(max_exp_avg_sq_new) + eps
+        max_exp_avg_sq_load = tl.load(
+            max_exp_avg_sq + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        max_exp_avg_sq_new = tl.maximum(max_exp_avg_sq_load, exp_avg_sq_new)
+        tl.store(
+            max_exp_avg_sq + offsets,
+            max_exp_avg_sq_new.to(max_exp_avg_sq.dtype.element_ty),
+            mask=mask,
+        )
+        denom = tl.sqrt(max_exp_avg_sq_new) / tl.sqrt(bias_correction2) + eps
     else:
-        denom = tl.sqrt(corrected_exp_avg_sq) + eps
+        denom = tl.sqrt(exp_avg_sq_new) / tl.sqrt(bias_correction2) + eps
 
-    # Compute the update step
-    # For weight decay, we use AdamW style (decay the parameters)
-    if weight_decay > 0:
-        # AdamW: param = param - lr * (m / denom + weight_decay * param)
-        update = corrected_exp_avg / denom + weight_decay * param_load
-    else:
-        # Adam: param = param - lr * m / denom
-        update = corrected_exp_avg / denom
+    step_size = lr / bias_correction1
+    param_new = param_load - step_size * exp_avg_new / denom
 
-    # Update parameters
-    param_new = param_load - lr * update
-
-    # Store updated values
-    tl.store(param + offsets, param_new, mask=mask)
-    tl.store(exp_avg + offsets, exp_avg_new, mask=mask)
-    tl.store(exp_avg_sq + offsets, exp_avg_sq_new, mask=mask)
+    tl.store(param + offsets, param_new.to(param.dtype.element_ty), mask=mask)
+    tl.store(exp_avg + offsets, exp_avg_new.to(exp_avg.dtype.element_ty), mask=mask)
+    tl.store(
+        exp_avg_sq + offsets, exp_avg_sq_new.to(exp_avg_sq.dtype.element_ty), mask=mask
+    )
 
 
 def _fused_adam(
@@ -127,76 +120,68 @@ def _fused_adam(
     grad_scale=None,
     found_inf=None,
 ):
-    """Fused Adam optimizer step.
-
-    Performs one step of the Adam optimizer algorithm:
-    - m = beta1 * m + (1 - beta1) * g
-    - v = beta2 * v + (1 - beta2) * g^2
-    - if amsgrad: v_hat = max(v_hat, v)
-    - p = p - lr * m / (sqrt(v_hat) + eps) - lr * weight_decay * p (AdamW)
-      or p = p - lr * m / (sqrt(v_hat) + eps) (Adam)
-    """
+    """Fused Adam optimizer step (L2 weight decay matching aten::_fused_adam_)."""
     logger.debug("GEMS FUSED_ADAM")
 
-    # Adam optimizer state must be float32
+    if not params:
+        return (params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs)
+
     for p in params:
-        assert p.dtype == torch.float32, "_fused_adam only supports float32 inputs"
+        assert p.dtype in (
+            torch.float32,
+            torch.bfloat16,
+            torch.float16,
+        ), f"_fused_adam supports float32/bfloat16/float16 inputs, got {p.dtype}"
 
-    # Handle grad_scale and found_inf (for gradient scaling and gradient skipping)
+    if found_inf is not None and found_inf.item() > 0:
+        return (params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs)
+
     if grad_scale is not None:
-        grads = [g * grad_scale for g in grads]
-    if found_inf is not None:
-        # Skip update if found_inf is True
-        if found_inf.item() > 0:
-            return (params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs)
+        grads = [g / grad_scale for g in grads]
 
-    # Process each parameter group
-    for i in range(len(params)):
-        param = params[i]
-        grad = grads[i]
-        exp_avg = exp_avgs[i]
-        exp_avg_sq = exp_avg_sqs[i]
-        step = state_steps[i].item() if state_steps[i].numel() > 0 else 0
+    lr_val = float(lr.item()) if isinstance(lr, torch.Tensor) else float(lr)
+    beta1_val = float(beta1)
+    beta2_val = float(beta2)
+    wd_val = float(weight_decay)
+    eps_val = float(eps)
+    has_wd = wd_val != 0.0
+    BLOCK_SIZE = 1024
 
-        # Bias correction for first and second moment estimates
-        # bias_correction1 = 1 - beta1^step
-        # bias_correction2 = 1 - beta2^step
-        bias_correction1 = 1 - beta1**step
-        bias_correction2 = 1 - beta2**step
+    with torch_device_fn.device(params[0].device):
+        for i, param in enumerate(params):
+            grad = grads[i]
+            exp_avg = exp_avgs[i]
+            exp_avg_sq = exp_avg_sqs[i]
+            step = int(state_steps[i].item()) if state_steps[i].numel() > 0 else 1
+            if step <= 0:
+                step = 1
 
-        n = param.numel()
+            bias_correction1 = 1.0 - (beta1_val**step)
+            bias_correction2 = 1.0 - (beta2_val**step)
+            n = param.numel()
+            if n == 0:
+                continue
+            grid = (triton.cdiv(n, BLOCK_SIZE),)
 
-        # Define block size
-        BLOCK_SIZE = triton.next_power_of_2(n)
-        # Use at least 128 threads for better occupancy
-        BLOCK_SIZE = max(BLOCK_SIZE, 128)
-        # Cap at 4096 to avoid excessive registers
-        BLOCK_SIZE = min(BLOCK_SIZE, 4096)
-
-        # Calculate grid
-        grid = (triton.cdiv(n, BLOCK_SIZE),)
-
-        # Run the kernel - pass tensors directly
-        _fused_adam_kernel[grid](
-            param,
-            grad,
-            exp_avg,
-            exp_avg_sq,
-            (
-                max_exp_avg_sqs[i] if max_exp_avg_sqs else exp_avg_sq
-            ),  # dummy if no amsgrad
-            n,
-            BLOCK_SIZE,
-            lr,
-            beta1,
-            beta2,
-            weight_decay,
-            eps,
-            bias_correction1,
-            bias_correction2,
-            amsgrad,
-            maximize,
-        )
+            _fused_adam_kernel[grid](
+                param,
+                grad,
+                exp_avg,
+                exp_avg_sq,
+                max_exp_avg_sqs[i] if (amsgrad and max_exp_avg_sqs) else exp_avg_sq,
+                n,
+                lr_val,
+                beta1_val,
+                beta2_val,
+                wd_val,
+                eps_val,
+                bias_correction1,
+                bias_correction2,
+                HAS_WEIGHT_DECAY=has_wd,
+                BLOCK_SIZE=BLOCK_SIZE,
+                amsgrad=amsgrad,
+                maximize=maximize,
+            )
 
     return (params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs)
 

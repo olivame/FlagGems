@@ -110,6 +110,30 @@ def _full_reduction_vectors(args):
     return int(args["n_elements"]) % (int(args["BLOCK"]) * int(args["VEC"])) == 0
 
 
+def _aligned_a_512x128(args):
+    return (
+        bool(args.get("ALLOW_ALIGNED_A", True))
+        and int(args["M"]) % 512 == 0
+        and int(args["K"]) % 128 == 0
+    )
+
+
+def _aligned_b_128x128(args):
+    return int(args["N"]) % 128 == 0 and int(args["K"]) % 128 == 0
+
+
+def _even_k_128(args):
+    return int(args["K"]) % 128 == 0
+
+
+def _even_m_512(args):
+    return int(args["M"]) % 512 == 0
+
+
+def _even_n_1024(args):
+    return int(args["N"]) % 1024 == 0
+
+
 def _is_transposed_contiguous_2d(tensor: torch.Tensor) -> bool:
     """Return whether ``tensor`` is a dense 2-D transpose view.
 
@@ -1031,9 +1055,14 @@ if HAS_PPU_TLE:
     )
     @triton.heuristics(
         values={
+            "ALIGNED_A_512X128": _aligned_a_512x128,
+            "ALIGNED_B_128X128": _aligned_b_128x128,
+            "EVEN_K": _even_k_128,
             "FULL_K_TILES": _full_k_tiles,
             "FULL_M_TILES": _full_m_tiles,
             "FULL_N_TILES": _full_n_tiles,
+            "EVEN_M": _even_m_512,
+            "EVEN_N": _even_n_1024,
         }
     )
     @triton.jit
@@ -1073,6 +1102,7 @@ if HAS_PPU_TLE:
         EVEN_N: tl.constexpr,
         FUSE_ADDMM: tl.constexpr,
         READ_BIAS: tl.constexpr,
+        ALLOW_ALIGNED_A: tl.constexpr = True,
     ):
         pid = tl.program_id(0)
         grid_m = tl.cdiv(M, BLOCK_M)
@@ -1148,9 +1178,11 @@ if HAS_PPU_TLE:
     )
     @triton.heuristics(
         values={
+            "EVEN_K": _even_k_128,
             "FULL_K_TILES": _full_k_tiles,
             "FULL_M_TILES": _full_m_tiles,
             "FULL_N_TILES": _full_n_tiles,
+            "EVEN_M": _even_m_512,
         }
     )
     @triton.jit
@@ -1966,12 +1998,7 @@ def _run_ppu_mm(
             bias_view.stride(1),
             B_TRANSPOSED=b_transposed,
             aiu_load_mask=_aiu_load_mask(a, b_view),
-            ALIGNED_A_512X128=(allow_aligned_a and M % 512 == 0 and K % 128 == 0),
-            ALIGNED_B_128X128=width % 128 == 0 and K % 128 == 0,
-            EVEN_K=K % 128 == 0,
-            EVEN_M=M % 512 == 0
-            or (not fuse_addmm and _is_deep_fixed_row(M, width, K) and M % 32 == 0),
-            EVEN_N=width % 1024 == 0,
+            ALLOW_ALIGNED_A=allow_aligned_a,
             FUSE_ADDMM=fuse_addmm,
             READ_BIAS=fuse_addmm and beta != 0,
         )
@@ -2217,8 +2244,6 @@ def _run_ppu_narrow_n_mm(
             expanded_bias.stride(1),
             B_TRANSPOSED=_b_transposed_layout(b),
             aiu_load_mask=_aiu_load_mask(a, b),
-            EVEN_K=K % 128 == 0,
-            EVEN_M=M % 512 == 0,
             FUSE_ADDMM=fuse_addmm,
             READ_BIAS=fuse_addmm and beta != 0,
         )

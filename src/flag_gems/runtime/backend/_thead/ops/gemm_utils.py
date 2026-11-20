@@ -590,7 +590,9 @@ def _prune_split_k_configs(configs, named_args, **kwargs):
     M = int(named_args.get("M", 1))
     N = int(named_args.get("N", 1))
     batch = max(int(named_args.get("batch", 1)), 1)
-    aiu_load_mask = named_args.get("aiu_load_mask", _AIU_LOAD_A | _AIU_LOAD_B)
+    aiu_load_mask = named_args.get(
+        "aiu_load_mask", kwargs.get("aiu_load_mask", _AIU_LOAD_A | _AIU_LOAD_B)
+    )
     filtered = []
     for config in configs:
         split_k = int(config.kwargs.get("SPLIT_K", 1))
@@ -687,7 +689,9 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
     """
     M = named_args.get("M")
     N = named_args.get("N")
-    aiu_load_mask = named_args.get("aiu_load_mask", _AIU_LOAD_A | _AIU_LOAD_B)
+    aiu_load_mask = named_args.get(
+        "aiu_load_mask", kwargs.get("aiu_load_mask", _AIU_LOAD_A | _AIU_LOAD_B)
+    )
 
     filtered = []
     for config in configs:
@@ -743,7 +747,9 @@ def _prune_gemm_configs(configs, named_args, **kwargs):
 
 def _prune_narrow_n_configs(configs, named_args, **kwargs):
     """Keep narrow-N candidates based only on legality/resource checks."""
-    aiu_load_mask = named_args.get("aiu_load_mask", _AIU_LOAD_A | _AIU_LOAD_B)
+    aiu_load_mask = named_args.get(
+        "aiu_load_mask", kwargs.get("aiu_load_mask", _AIU_LOAD_A | _AIU_LOAD_B)
+    )
     filtered = []
     for config in configs:
         bm = int(config.kwargs.get("BLOCK_M", 16))

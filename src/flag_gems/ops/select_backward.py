@@ -19,21 +19,25 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry
+
 _BLOCK = 1024
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
+@libentry()
+@triton.jit(do_not_specialize=["total", "inner_size", "dim_stride", "index"])
 def _select_backward_kernel(
     grad_ptr,
     out_ptr,
-    total: tl.constexpr,
-    inner_size: tl.constexpr,
-    dim_stride: tl.constexpr,
-    index: tl.constexpr,
+    total,
+    inner_size,
+    dim_stride,
+    index,
     BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
 
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total
@@ -92,13 +96,14 @@ def select_backward(grad, input_sizes, dim, index, out=None):
     n_elements = outer_size * inner_size
     grid = (triton.cdiv(n_elements, _BLOCK),)
 
-    _select_backward_kernel[grid](
-        grad_view,
-        out,
-        total,
-        inner_size,
-        dim_stride,
-        index,
-        BLOCK=_BLOCK,
-    )
+    with torch_device_fn.device(grad.device):
+        _select_backward_kernel[grid](
+            grad_view,
+            out,
+            total,
+            inner_size,
+            dim_stride,
+            index,
+            BLOCK=_BLOCK,
+        )
     return out

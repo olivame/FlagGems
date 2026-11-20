@@ -458,6 +458,153 @@ def mul_complex_generic_nd_runtime_meta_kernel(
     tl.store(out_i_ptr + out_i_offsets, out_i, mask=mask)
 
 
+@libentry()
+@libtuner(
+    configs=mul_broadcast_get_configs(),
+    key=["n_elements", "dtype"],
+    strategy=["align32", "default"],
+    warmup=5,
+    rep=5,
+    flagtune_op_name="mul",
+    flagtune_expand_op_name="mul",
+)
+@triton.jit(
+    do_not_specialize=[
+        "s0", "s1", "s2", "s3",
+        "a_s0", "a_s1", "a_s2", "a_s3",
+        "b_s0", "b_s1", "b_s2", "b_s3",
+        "o_s0", "o_s1", "o_s2", "o_s3",
+    ]
+)
+def mul_generic_4d_scalar_kernel(
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    n_elements,
+    s0, s1, s2, s3,
+    a_s0, a_s1, a_s2, a_s3,
+    b_s0, b_s1, b_s2, b_s3,
+    o_s0, o_s1, o_s2, o_s3,
+    dtype: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    IS_BOOL: tl.constexpr,
+    USE_INT64: tl.constexpr,
+):
+    if USE_INT64:
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    else:
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    linear = offsets
+    i3 = linear % s3
+    linear = linear // s3
+    i2 = linear % s2
+    linear = linear // s2
+    i1 = linear % s1
+    i0 = linear // s1
+
+    a_off = i0 * a_s0 + i1 * a_s1 + i2 * a_s2 + i3 * a_s3
+    b_off = i0 * b_s0 + i1 * b_s1 + i2 * b_s2 + i3 * b_s3
+    o_off = i0 * o_s0 + i1 * o_s1 + i2 * o_s2 + i3 * o_s3
+
+    a = tl.load(a_ptr + a_off, mask=mask)
+    b = tl.load(b_ptr + b_off, mask=mask)
+    out = a & b if IS_BOOL else a * b
+    tl.store(out_ptr + o_off, out, mask=mask)
+
+
+@libentry()
+@libtuner(
+    configs=mul_broadcast_get_configs(),
+    key=["n_elements", "dtype"],
+    strategy=["align32", "default"],
+    warmup=5,
+    rep=5,
+    flagtune_op_name="mul",
+    flagtune_expand_op_name="mul",
+)
+@triton.jit(
+    do_not_specialize=[
+        "s0", "s1", "s2", "s3",
+        "ar_s0", "ar_s1", "ar_s2", "ar_s3",
+        "ai_s0", "ai_s1", "ai_s2", "ai_s3",
+        "br_s0", "br_s1", "br_s2", "br_s3",
+        "bi_s0", "bi_s1", "bi_s2", "bi_s3",
+        "or_s0", "or_s1", "or_s2", "or_s3",
+        "oi_s0", "oi_s1", "oi_s2", "oi_s3",
+    ]
+)
+def mul_complex_generic_4d_scalar_kernel(
+    ar_ptr,
+    ai_ptr,
+    br_ptr,
+    bi_ptr,
+    out_r_ptr,
+    out_i_ptr,
+    n_elements,
+    s0, s1, s2, s3,
+    ar_s0, ar_s1, ar_s2, ar_s3,
+    ai_s0, ai_s1, ai_s2, ai_s3,
+    br_s0, br_s1, br_s2, br_s3,
+    bi_s0, bi_s1, bi_s2, bi_s3,
+    or_s0, or_s1, or_s2, or_s3,
+    oi_s0, oi_s1, oi_s2, oi_s3,
+    dtype: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    USE_INT64: tl.constexpr,
+):
+    if USE_INT64:
+        offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    else:
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    linear = offsets
+    i3 = linear % s3
+    linear = linear // s3
+    i2 = linear % s2
+    linear = linear // s2
+    i1 = linear % s1
+    i0 = linear // s1
+
+    ar_off = i0 * ar_s0 + i1 * ar_s1 + i2 * ar_s2 + i3 * ar_s3
+    ai_off = i0 * ai_s0 + i1 * ai_s1 + i2 * ai_s2 + i3 * ai_s3
+    br_off = i0 * br_s0 + i1 * br_s1 + i2 * br_s2 + i3 * br_s3
+    bi_off = i0 * bi_s0 + i1 * bi_s1 + i2 * bi_s2 + i3 * bi_s3
+    or_off = i0 * or_s0 + i1 * or_s1 + i2 * or_s2 + i3 * or_s3
+    oi_off = i0 * oi_s0 + i1 * oi_s1 + i2 * oi_s2 + i3 * oi_s3
+
+    ar = tl.load(ar_ptr + ar_off, mask=mask, other=0.0)
+    ai = tl.load(ai_ptr + ai_off, mask=mask, other=0.0)
+    br = tl.load(br_ptr + br_off, mask=mask, other=0.0)
+    bi = tl.load(bi_ptr + bi_off, mask=mask, other=0.0)
+
+    out_r = ar * br - ai * bi
+    out_i = ar * bi + ai * br
+    tl.store(out_r_ptr + or_off, out_r, mask=mask)
+    tl.store(out_i_ptr + oi_off, out_i, mask=mask)
+
+
+def _is_shape_bucketing_enabled() -> bool:
+    autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
+    return bool(autotuning is not None and getattr(autotuning, "shape_bucketing", False))
+
+
+def _pad4(vals, pad_val):
+    if len(vals) < 4:
+        return (pad_val,) * (4 - len(vals)) + tuple(vals)
+    return tuple(vals)
+
+
+def _needs_int64_indexing(n_elements, shape, stride_tuples) -> bool:
+    if n_elements >= 2**31:
+        return True
+    for st in stride_tuples:
+        max_off = sum((int(d) - 1) * abs(int(s)) for d, s in zip(shape, st) if d > 0)
+        if max_off >= 2**31:
+            return True
+    return False
+
+
 def _is_tensor_or_number(value) -> bool:
     return isinstance(value, torch.Tensor) or isinstance(value, Number)
 
@@ -643,7 +790,28 @@ def _launch_generic(a_t, b_t, output, out_shape, a_stride, b_stride, out_stride,
     b_stride = b_stride or (0,)
     out_stride = out_stride or (0,)
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    if _needs_runtime_meta_for_constexpr_tuple():
+    if _is_shape_bucketing_enabled() and ndim <= 4:
+        s0, s1, s2, s3 = _pad4(shape, 1)
+        a_s0, a_s1, a_s2, a_s3 = _pad4(a_stride, 0)
+        b_s0, b_s1, b_s2, b_s3 = _pad4(b_stride, 0)
+        o_s0, o_s1, o_s2, o_s3 = _pad4(out_stride, 0)
+        use_int64 = _needs_int64_indexing(n_elements, shape, (a_stride, b_stride, out_stride))
+        with torch_device_fn.device(output.device):
+            mul_generic_4d_scalar_kernel[grid](
+                a_t,
+                b_t,
+                output,
+                n_elements,
+                s0, s1, s2, s3,
+                a_s0, a_s1, a_s2, a_s3,
+                b_s0, b_s1, b_s2, b_s3,
+                o_s0, o_s1, o_s2, o_s3,
+                dtype=_dtype_name(dtype),
+                IS_BOOL=_is_bool_dtype(dtype),
+                USE_INT64=use_int64,
+            )
+        return output
+    if _needs_runtime_meta_for_constexpr_tuple() or _is_shape_bucketing_enabled():
         meta = torch.tensor(
             shape + a_stride + b_stride + out_stride,
             device=output.device,
@@ -787,7 +955,40 @@ def _launch_complex_generic(
     out_r_stride = out_r_stride or (0,)
     out_i_stride = out_i_stride or (0,)
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    if _needs_runtime_meta_for_constexpr_tuple():
+    if _is_shape_bucketing_enabled() and ndim <= 4 and kernels is None:
+        s0, s1, s2, s3 = _pad4(shape, 1)
+        ar_s0, ar_s1, ar_s2, ar_s3 = _pad4(strides[0], 0)
+        ai_s0, ai_s1, ai_s2, ai_s3 = _pad4(strides[1], 0)
+        br_s0, br_s1, br_s2, br_s3 = _pad4(strides[2], 0)
+        bi_s0, bi_s1, bi_s2, bi_s3 = _pad4(strides[3], 0)
+        or_s0, or_s1, or_s2, or_s3 = _pad4(out_r_stride, 0)
+        oi_s0, oi_s1, oi_s2, oi_s3 = _pad4(out_i_stride, 0)
+        use_int64 = _needs_int64_indexing(
+            n_elements,
+            shape,
+            (strides[0], strides[1], strides[2], strides[3], out_r_stride, out_i_stride),
+        )
+        with torch_device_fn.device(output.device):
+            mul_complex_generic_4d_scalar_kernel[grid](
+                ar,
+                ai,
+                br,
+                bi,
+                out_r,
+                out_i,
+                n_elements,
+                s0, s1, s2, s3,
+                ar_s0, ar_s1, ar_s2, ar_s3,
+                ai_s0, ai_s1, ai_s2, ai_s3,
+                br_s0, br_s1, br_s2, br_s3,
+                bi_s0, bi_s1, bi_s2, bi_s3,
+                or_s0, or_s1, or_s2, or_s3,
+                oi_s0, oi_s1, oi_s2, oi_s3,
+                dtype=_dtype_name(dtype),
+                USE_INT64=use_int64,
+            )
+        return output
+    if _needs_runtime_meta_for_constexpr_tuple() or _is_shape_bucketing_enabled():
         meta = torch.tensor(
             shape
             + strides[0]

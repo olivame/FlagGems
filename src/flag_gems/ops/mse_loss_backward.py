@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as tle
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 @libentry()
-@triton.jit
+@triton.jit(do_not_specialize=["N", "M"])
 def mse_loss_backward_kernel(
     grad_output_ptr,
     self_ptr,
@@ -34,29 +35,33 @@ def mse_loss_backward_kernel(
     out_ptr,
     N,
     M,
-    reduction,
+    REDUCTION: tl.constexpr,
+    IS_SCALAR_GRAD: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     """Kernel for mse_loss_backward.
 
     grad = 2 * (self - target) * grad_output / factor
-    where factor = 1 for reduction=none/sum, N for reduction=mean
+    where factor = N for reduction=mean (1), 1 for none/sum (0/2).
     """
-    pid = tle.program_id(0)
+    pid = tle.program_id(0).to(tl.int64)
     offset = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     mask = offset < M
 
-    # Load data (flattened view)
-    grad_val = tl.load(grad_output_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    if IS_SCALAR_GRAD:
+        grad_val = tl.load(grad_output_ptr).to(tl.float32)
+    else:
+        grad_val = tl.load(grad_output_ptr + offset, mask=mask, other=0.0).to(
+            tl.float32
+        )
     self_val = tl.load(self_ptr + offset, mask=mask, other=0.0).to(tl.float32)
     target_val = tl.load(target_ptr + offset, mask=mask, other=0.0).to(tl.float32)
 
     diff = self_val - target_val
-
-    # reduction: 0 = none, 1 = mean, 2 = sum
-    # factor = N for mean, 1 otherwise
-    factor = tl.where(reduction == 1, N, 1.0)
-    grad = (2.0 * diff * grad_val) / factor
+    if REDUCTION == 1:
+        grad = (2.0 * diff * grad_val) / N
+    else:
+        grad = 2.0 * diff * grad_val
 
     tl.store(out_ptr + offset, grad.to(out_ptr.dtype.element_ty), mask=mask)
 
@@ -72,35 +77,32 @@ def mse_loss_backward(grad_output, self, target, reduction=1):
     """
     logger.debug("GEMS MSE_LOSS_BACKWARD")
 
-    # Save original shape
     original_shape = self.shape
-
-    # Flatten tensors to 1D
-    grad_output = grad_output.flatten()
-    self = self.flatten()
-    target = target.flatten()
-
     M = self.numel()
+    if M == 0:
+        return torch.empty_like(self)
 
-    # Allocate output
-    out = torch.empty_like(self)
+    grad_output_c = grad_output.contiguous().reshape(-1)
+    self_c = self.contiguous().reshape(-1)
+    target_c = target.contiguous().reshape(-1)
 
-    # Determine block size
-    BLOCK_M = min(triton.next_power_of_2(M), 1024)
+    out = torch.empty_like(self_c)
+    is_scalar_grad = (int(reduction) != 0) or (grad_output_c.numel() == 1)
+
+    BLOCK_M = 1024
     grid = (triton.cdiv(M, BLOCK_M),)
 
-    mse_loss_backward_kernel[grid](
-        grad_output,
-        self,
-        target,
-        out,
-        M,  # N = M for scalar reduction
-        M,
-        reduction,
-        BLOCK_M=BLOCK_M,
-    )
+    with torch_device_fn.device(self.device):
+        mse_loss_backward_kernel[grid](
+            grad_output_c,
+            self_c,
+            target_c,
+            out,
+            float(M),
+            M,
+            REDUCTION=int(reduction),
+            IS_SCALAR_GRAD=is_scalar_grad,
+            BLOCK_M=BLOCK_M,
+        )
 
-    # Reshape output to original shape
-    out = out.reshape(original_shape)
-
-    return out
+    return out.reshape(original_shape)

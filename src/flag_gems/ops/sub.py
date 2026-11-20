@@ -96,6 +96,11 @@ def sub(A, B, *, alpha=1):
             out_real = sub_func(Ar, Br, alpha)
             return torch.view_as_complex(out_real).to(torch.result_type(A, B))
     elif isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
+        if A.device != B.device:
+            if A.ndim == 0 and A.device.type == "cpu":
+                return sub_func_scalar_tensor(A.item(), B, alpha)
+            if B.ndim == 0 and B.device.type == "cpu":
+                return sub_func_tensor_scalar(A, B.item(), alpha)
         return sub_func(A, B, alpha)
     elif isinstance(A, torch.Tensor):
         return sub_func_tensor_scalar(A, B, alpha)
@@ -109,6 +114,8 @@ def sub(A, B, *, alpha=1):
 def sub_(A, B, *, alpha=1):
     logger.debug("GEMS SUB_")
     if isinstance(B, torch.Tensor):
+        if A.device != B.device and B.ndim == 0 and B.device.type == "cpu":
+            return sub_func_tensor_scalar(A, B.item(), alpha, out0=A)
         return sub_func(A, B, alpha, out0=A)
     else:
         return sub_func_tensor_scalar(A, B, alpha, out0=A)

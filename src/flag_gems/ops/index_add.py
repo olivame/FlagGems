@@ -19,6 +19,7 @@ from typing import Any, Callable, List, Mapping, Tuple
 
 import torch
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils.code_cache import code_cache_dir
 from flag_gems.utils.code_utils import IndentedBuffer
 
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 def generate_imports(code: IndentedBuffer) -> IndentedBuffer:
     code.writeline("import triton")
     code.writeline("import triton.language as tl")
+    code.writeline("from flag_gems.runtime import torch_device_fn")
     code.writeline("from flag_gems.utils import libentry")
 
     code.newline()
@@ -38,14 +40,13 @@ def generate_imports(code: IndentedBuffer) -> IndentedBuffer:
 
 def generate_index_add_kernel(
     rank: int,
+    dim: int,
     kernel_name: str,
     code: IndentedBuffer,
 ) -> IndentedBuffer:
-    # the decorators
     code.writeline("@libentry()")
     code.writeline("@triton.jit")
 
-    # signature
     code.writeline(f"def {kernel_name}(")
     with code.indent():
         if rank > 0:
@@ -53,63 +54,59 @@ def generate_index_add_kernel(
             code.writeline("src,")
             code.writeline("out,")
             code.writeline("N,")
-            code.writeline("inp_numel,")
-            code.writeline("inp_stride_dim,")
-            code.writeline("inp_shape_dim,")
-            code.writeline("src_shape_dim,")
-            code.writeline("delta,")
+            code.writeline("out_shape_dim,")
+            code.writeline("index_stride,")
             code.writeline("alpha,")
 
-            stride_args = ", ".join(f"src_stride_{i}: int" for i in range(rank))
-            code.writeline(f"{stride_args}, # stride for src")
+            src_stride_args = ", ".join(f"src_stride_{i}: tl.int64" for i in range(rank))
+            code.writeline(f"{src_stride_args}, # stride for src")
 
-            shape_args = ", ".join(f"src_shape_{i}: int" for i in range(rank))
+            out_stride_args = ", ".join(f"out_stride_{i}: tl.int64" for i in range(rank))
+            code.writeline(f"{out_stride_args}, # stride for out")
+
+            shape_args = ", ".join(f"src_shape_{i}: tl.int64" for i in range(rank))
             code.writeline(f"{shape_args}, # shape for src")
 
             code.writeline("BLOCK_SIZE: tl.constexpr,")
 
         code.writeline("):")
 
-        # Kernel Code
         with code.indent():
-            code.writeline("pid = tl.program_id(axis=0)")
-            code.writeline("offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)")
+            code.writeline("pid = tl.program_id(axis=0).to(tl.int64)")
+            code.writeline(
+                "offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)"
+            )
             code.writeline("mask = offsets < N")
+            code.writeline("rem = offsets")
 
             for i in range(rank - 1, -1, -1):
-                code.writeline(f"src_offset{i} = offsets % src_shape_{i}")
-                code.writeline(f"offsets = offsets // src_shape_{i}")
+                code.writeline(f"coord_{i} = rem % src_shape_{i}")
+                code.writeline(f"rem = rem // src_shape_{i}")
             code.newline()
-            comp = [f"src_offset{i} * src_stride_{i}" for i in range(rank)]
-            code.writeline(f"src_offset = {' + '.join(comp)}")
 
-            code.writeline("pre_cal = (inp_stride_dim * src_shape_dim)")
+            src_comp = [f"coord_{i} * src_stride_{i}" for i in range(rank)]
+            code.writeline(f"src_offset = {' + '.join(src_comp)}")
 
-            # index add
-            code.writeline("pre_idx = (src_offset // pre_cal).to(tl.int64)")
+            code.writeline(f"index_offset = coord_{dim} * index_stride")
             code.writeline(
-                "dim_idx = (src_offset % pre_cal // inp_stride_dim).to(tl.int64)"
-            )
-            code.writeline(
-                "src_dim_idx = (tl.load(index + dim_idx, mask=mask, other=0)).to(tl.int64)"
-            )
-            code.writeline(
-                'assert src_dim_idx >= 0 and src_dim_idx < inp_shape_dim, "0 <= index < self.size(dim)"'
-            )
-            code.writeline(
-                "input_idx = (src_offset + (delta * pre_idx + src_dim_idx - dim_idx) * inp_stride_dim).to(tl.int64)"
+                "dst_dim_idx = tl.load(index + index_offset, mask=mask, other=0).to(tl.int64)"
             )
 
-            code.writeline("input_mask = input_idx < inp_numel")
+            out_comp = [
+                f"dst_dim_idx * out_stride_{i}" if i == dim else f"coord_{i} * out_stride_{i}"
+                for i in range(rank)
+            ]
+            code.writeline(f"out_offset = {' + '.join(out_comp)}")
+
             code.writeline(
-                "add_on = tl.load(src + src_offset, mask=mask, other=0) * alpha"
+                "valid_mask = mask & (dst_dim_idx >= 0) & (dst_dim_idx < out_shape_dim)"
             )
             code.writeline(
-                "tl.atomic_add(out + input_idx, add_on, mask=input_mask, sem='relaxed')"
+                "add_on = tl.load(src + src_offset, mask=valid_mask, other=0) * alpha"
             )
-            # TODO: tl.atomic_add doesn't support bfloat16! The following method may be unsafe.
-            # code.writeline("cur_out = tl.load(out + input_idx, mask=input_mask)")
-            # code.writeline("tl.store(out + input_idx, cur_out + add_on, mask=input_mask)")
+            code.writeline(
+                "tl.atomic_add(out + out_offset, add_on, mask=valid_mask, sem='relaxed')"
+            )
 
         code.newline()
         code.newline()
@@ -117,20 +114,15 @@ def generate_index_add_kernel(
 
 
 def parameter_for_wrapper() -> str:
-    # out, index, src, dim, inp_stride_dim, src_shape_dim, delta, N, inp.numel(), alpha
-    parameters: List[str] = []
-    parameters.append("out")
-    parameters.append("index")
-    parameters.append("src")
-    parameters.append("dim")
-    parameters.append("inp_stride_dim")
-    parameters.append("inp_shape_dim")
-    parameters.append("src_shape_dim")
-    parameters.append("delta")
-    parameters.append("N")
-    parameters.append("inp_numel")
-    parameters.append("alpha")
-
+    parameters: List[str] = [
+        "out",
+        "index",
+        "src",
+        "dim",
+        "out_shape_dim",
+        "N",
+        "alpha",
+    ]
     return ", ".join(parameters)
 
 
@@ -141,47 +133,52 @@ def generate_destination_passing_wrapper(
     code: IndentedBuffer,
 ) -> IndentedBuffer:
     parameters: str = parameter_for_wrapper()
-    wrapper_signature: str = f"def {wrapper_name} ({parameters}):"
+    wrapper_signature: str = f"def {wrapper_name}({parameters}):"
     code.writeline(wrapper_signature)
 
     with code.indent():
-        code.writeline("src_strides = list(src.stride())")
-        code.writeline("src_shapes = list(src.shape)")
-
-        # kernel launch
-        code.writeline("BLOCK_SIZE = 128")  # BLOCK_SIZE setting
-        code.writeline("grid = (triton.cdiv(N, BLOCK_SIZE),)")
-        kernel_launch: str = f"{kernel_name}[grid]("
-        code.writeline(kernel_launch)
+        code.writeline("if N == 0:")
         with code.indent():
-            code.writeline(
-                "index, src, out, N, inp_numel, inp_stride_dim, inp_shape_dim, src_shape_dim, delta, alpha, "
-            )
-            if rank > 0:
-                s = ", ".join(f"src_strides[{i}]" for i in range(rank))
-                code.writeline(f"{s},")
+            code.writeline("return out")
+        code.writeline("src_strides = list(src.stride())")
+        code.writeline("out_strides = list(out.stride())")
+        code.writeline("src_shapes = list(src.shape)")
+        code.writeline("index_stride = index.stride(0) if index.ndim > 0 else 0")
 
-                s = ", ".join(f"src_shapes[{i}]" for i in range(rank))
-                code.writeline(f"{s},")
-            code.writeline("BLOCK_SIZE=BLOCK_SIZE")
-        code.writeline(")")
+        code.writeline("BLOCK_SIZE = 128")
+        code.writeline("grid = (triton.cdiv(N, BLOCK_SIZE),)")
+        code.writeline("with torch_device_fn.device(out.device):")
+        with code.indent():
+            code.writeline(f"{kernel_name}[grid](")
+            with code.indent():
+                code.writeline("index, src, out, N, out_shape_dim, index_stride, alpha,")
+                if rank > 0:
+                    s = ", ".join(f"src_strides[{i}]" for i in range(rank))
+                    code.writeline(f"{s},")
+                    o = ", ".join(f"out_strides[{i}]" for i in range(rank))
+                    code.writeline(f"{o},")
+                    sh = ", ".join(f"src_shapes[{i}]" for i in range(rank))
+                    code.writeline(f"{sh},")
+                code.writeline("BLOCK_SIZE=BLOCK_SIZE,")
+            code.writeline(")")
         code.writeline("return out")
 
     return code
 
 
 def generate_code(
-    inputs: Tuple[Any],
+    inputs: Tuple[Any, ...],
     wrapper_name: str,
     kernel_name: str,
     code: IndentedBuffer,
 ) -> IndentedBuffer:
-    # inputs: [out, index, src, dim, inp_stride_dim, inp_shape_dim, src_shape_dim, delta, N, inp.numel(), alpha]
+    # inputs: [out, index, src, dim, out_shape_dim, N, alpha]
     shape = inputs[2].shape
     rank = len(shape)
+    dim = int(inputs[3])
 
     code = generate_imports(code)
-    code = generate_index_add_kernel(rank, kernel_name, code)
+    code = generate_index_add_kernel(rank, dim, kernel_name, code)
     code = generate_destination_passing_wrapper(rank, wrapper_name, kernel_name, code)
     return code
 
@@ -204,14 +201,13 @@ class IndexAddFunction:
                 code,
             )
 
-            file_name = f"index_add_rank_{key}_pid_{self.pid}.py"
+            file_name = f"index_add_v2_rank_{key}_pid_{self.pid}.py"
 
             with open(code_cache_dir() / file_name, "wt", encoding="utf-8") as f:
                 f.write(code.getvalue())
 
-            # load
             spec = importlib.util.spec_from_file_location(
-                f"_gen_module_rank_{key}_pid_{self.pid}",
+                f"_gen_module_v2_rank_{key}_pid_{self.pid}",
                 f.name,
             )
 
@@ -223,58 +219,58 @@ class IndexAddFunction:
         return overload(*args, **kwargs)
 
     def arg_key(self, *args):
-        tensors = [item for item in args if torch.is_tensor(item)]
-        max_rank = max(item.ndim for item in tensors)
-        return max_rank
+        rank = args[2].ndim
+        dim = int(args[3])
+        return f"{rank}_dim_{dim}"
 
 
 _index_add_func = IndexAddFunction()
 
 
-def index_add(inp, dim, index, src, alpha=1):
-    logger.debug("GEMS INDEX_ADD")
-    assert ((0 <= index) * (index < inp.size(dim))).equal(
-        torch.ones(tuple(index.shape), dtype=torch.bool, device=inp.device)
-    ), "0 <= index < self.size(dim)"
+def _validate_index_add_args(inp, dim, index, src):
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
-    assert index.numel() == src.size(
-        dim
-    ), "The dimth dimension of source must have the same size as the length of index"
+    dim %= inp.ndim
     assert (
         inp.ndim == src.ndim
     ), "Self and source should have the same number of dimensions"
-    assert (
-        ((inp.size(i) == src.size(i)) or i == dim) for i in range(0, inp.ndim)
+    assert index.numel() == src.size(
+        dim
+    ), "The dimth dimension of source must have the same size as the length of index"
+    assert all(
+        (inp.size(i) == src.size(i)) or i == dim for i in range(0, inp.ndim)
     ), "src.size(d) == self.size(d) for all dimensions d != dim"
+    if index.numel() > 0:
+        assert bool(
+            ((0 <= index) & (index < inp.size(dim))).all().item()
+        ), "0 <= index < self.size(dim)"
+    return dim
 
-    # MetaX workaround: tl.atomic_add does not support bf16 in MLIR backend.
-    # Cast to float32, perform the operation, and cast back.
+
+def index_add(inp, dim, index, src, alpha=1):
+    logger.debug("GEMS INDEX_ADD")
+    dim = _validate_index_add_args(inp, dim, index, src)
+    index_1d = index.reshape(-1)
+
     orig_dtype = inp.dtype
     needs_cast = orig_dtype == torch.bfloat16
     if needs_cast:
         out = inp.clone().to(torch.float32)
-        src = src.to(torch.float32)
+        src_work = src.to(torch.float32)
     else:
         out = inp.clone()
+        src_work = src
 
-    dim %= inp.ndim
-    inp_stride_dim = inp.stride(dim)
-    src_shape_dim = src.size(dim)
-    inp_shape_dim = inp.size(dim)
-    delta = inp.size(dim) - src_shape_dim
-    N = src.numel()
+    N = src_work.numel()
+    if N == 0:
+        return out.to(orig_dtype) if needs_cast else out
 
     _index_add_func(
         out,
-        index,
-        src,
+        index_1d,
+        src_work,
         dim,
-        inp_stride_dim,
-        inp_shape_dim,
-        src_shape_dim,
-        delta,
+        out.size(dim),
         N,
-        inp.numel(),
         alpha,
     )
     if needs_cast:
@@ -284,48 +280,29 @@ def index_add(inp, dim, index, src, alpha=1):
 
 def index_add_(inp, dim, index, src, alpha=1):
     logger.debug("GEMS INDEX_ADD_")
-    assert ((0 <= index) * (index < inp.size(dim))).equal(
-        torch.ones(tuple(index.shape), dtype=torch.bool, device=inp.device)
-    ), "0 <= index < self.size(dim)"
-    assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
-    assert index.numel() == src.size(
-        dim
-    ), "The dimth dimension of source must have the same size as the length of index"
-    assert (
-        inp.ndim == src.ndim
-    ), "Self and source should have the same number of dimensions"
-    assert (
-        ((inp.size(i) == src.size(i)) or i == dim) for i in range(0, inp.ndim)
-    ), "src.size(d) == self.size(d) for all dimensions d != dim"
+    dim = _validate_index_add_args(inp, dim, index, src)
+    index_1d = index.reshape(-1)
 
-    # MetaX workaround: tl.atomic_add does not support bf16 in MLIR backend.
-    # Cast to float32, perform the operation, and cast back in-place.
+    N = src.numel()
+    if N == 0:
+        return inp
+
     orig_dtype = inp.dtype
     needs_cast = orig_dtype == torch.bfloat16
     if needs_cast:
         out = inp.to(torch.float32)
-        src = src.to(torch.float32)
+        src_work = src.to(torch.float32)
     else:
         out = inp
-
-    dim %= inp.ndim
-    inp_stride_dim = inp.stride(dim)
-    src_shape_dim = src.size(dim)
-    inp_shape_dim = inp.size(dim)
-    delta = inp.size(dim) - src_shape_dim
-    N = src.numel()
+        src_work = src
 
     _index_add_func(
         out,
-        index,
-        src,
+        index_1d,
+        src_work,
         dim,
-        inp_stride_dim,
-        inp_shape_dim,
-        src_shape_dim,
-        delta,
+        out.size(dim),
         N,
-        inp.numel(),
         alpha,
     )
     if needs_cast:

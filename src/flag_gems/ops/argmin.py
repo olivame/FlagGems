@@ -201,7 +201,7 @@ def argmin_kernel(
             + n_offset[None, :].to(tl.int64) * K
             + pid_k
         )
-        mask = m_offset[:, None] < M and n_offset[None, :] < N
+        mask = (m_offset[:, None] < M) & (n_offset[None, :] < N)
         inp_ptrs = inp + offset
         inp_vals = tl.load(inp_ptrs, mask=mask, other=max_value)
         # tl.bfloat is promoted to tl.float32 by tl.min

@@ -253,9 +253,10 @@ def layer_norm_backward_kernel(
 ):
     pid = ext.program_id(0) * BLOCK_ROW_SIZE + tl.arange(0, BLOCK_ROW_SIZE)[:, None]
     row_mask = pid < M
-    dY += pid * N
-    X += pid * N
-    dX += pid * N
+    pid_i64 = pid.to(tl.int64)
+    dY += pid_i64 * N
+    X += pid_i64 * N
+    dX += pid_i64 * N
     Mean += pid
     Rstd += pid
 
@@ -268,7 +269,7 @@ def layer_norm_backward_kernel(
     for off in range(0, N, BLOCK_COL_SIZE):
         cols = off + tl.arange(0, BLOCK_COL_SIZE)
         col_mask = cols[None, :] < N
-        mask = row_mask and col_mask
+        mask = row_mask & col_mask
         dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
         x = tl.load(X + cols[None, :], mask).to(tl.float32)
         x = tl.where(mask, x - mean, 0.0)
@@ -287,7 +288,7 @@ def layer_norm_backward_kernel(
     for off in range(0, N, BLOCK_COL_SIZE):
         cols = off + tl.arange(0, BLOCK_COL_SIZE)
         col_mask = cols[None, :] < N
-        mask = row_mask and col_mask
+        mask = row_mask & col_mask
         dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
         x = tl.load(X + cols[None, :], mask).to(tl.float32)
         if W is None:
@@ -328,18 +329,19 @@ def weight_bias_backward_kernel(
     for off in range(0, M, BLOCK_ROW_SIZE):
         rows = off + tl.arange(0, BLOCK_ROW_SIZE)[:, None]
         row_mask = rows < M
-        mask = row_mask and col_mask[None, :]
-        dy = tl.load(dY + rows * N, mask).to(tl.float32)
-        x = tl.load(X + rows * N, mask).to(tl.float32)
+        rows_i64 = rows.to(tl.int64)
+        mask = row_mask & col_mask[None, :]
+        dy = tl.load(dY + rows_i64 * N, mask).to(tl.float32)
+        x = tl.load(X + rows_i64 * N, mask).to(tl.float32)
         mean = tl.load(Mean + rows, mask=rows < M).to(tl.float32)
         rstd = tl.load(Rstd + rows, mask=rows < M).to(tl.float32)
         x = tl.where(mask, x - mean, 0.0)
         accW += dy * x * rstd
         accB += dy
-    if dW:
+    if dW is not None:
         dw = tl.sum(accW, axis=0)
         tl.store(dW + pid, dw, mask=col_mask)
-    if dB:
+    if dB is not None:
         db = tl.sum(accB, axis=0)
         tl.store(dB + pid, db, mask=col_mask)
 
@@ -357,8 +359,11 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
 
     # NOTE: when the input is half-precision(either float16 or bfloat16)
     # these statistical data saved for backward is in single precision
-    mean = torch.empty(M, dtype=input.dtype, device=input.device)
-    rstd = torch.empty(M, dtype=input.dtype, device=input.device)
+    acc_type = (
+        torch.float32 if input.dtype in (torch.float16, torch.bfloat16) else input.dtype
+    )
+    mean = torch.empty(M, dtype=acc_type, device=input.device)
+    rstd = torch.empty(M, dtype=acc_type, device=input.device)
 
     with torch_device_fn.device(input.device):
         if N <= 128:
@@ -428,8 +433,11 @@ def layer_norm_backward(
     weight = None if weight is None else weight.contiguous()
     bias = None if bias is None else bias.contiguous()
 
-    M = input.shape[0]
-    N = input.numel() // M
+    if output_mask is None:
+        output_mask = (True, weight is not None, bias is not None)
+
+    N = math.prod(normalized_shape)
+    M = input.numel() // N
 
     if output_mask[0]:
         in_grad = torch.empty_like(input)
@@ -441,12 +449,14 @@ def layer_norm_backward(
     else:
         in_grad = None
 
-    if output_mask[1] is False and output_mask[2] is False:
+    need_dw = bool(output_mask[1]) and (weight is not None)
+    need_db = bool(output_mask[2]) and (bias is not None)
+    if not need_dw and not need_db:
         return in_grad, None, None
 
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_COL_SIZE"]), 1, 1)
-    weight_grad = torch.empty_like(weight) if output_mask[1] else None
-    bias_grad = torch.empty_like(bias) if output_mask[2] else None
+    weight_grad = torch.empty_like(weight) if need_dw else None
+    bias_grad = torch.empty_like(bias) if need_db else None
     with torch_device_fn.device(input.device):
         weight_bias_backward_kernel[grid](
             grad_out, input, mean, rstd, weight_grad, bias_grad, M, N

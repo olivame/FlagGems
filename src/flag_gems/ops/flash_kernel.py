@@ -409,10 +409,10 @@ def flash_fwd_kernel(
 
     col_max = seqlen_k
     if is_causal or is_local:
-        col_max += (m_block - num_m_blocks + 1) * BLOCK_M
+        col_max = (m_block + 1) * BLOCK_M + seqlen_k - seqlen_q
         if is_local:
             col_max += window_size_right
-        col_max = min(seqlen_k, col_max)
+        col_max = max(0, min(seqlen_k, col_max))
 
     if not IS_EVEN_MN:
         # round right
@@ -449,7 +449,7 @@ def flash_fwd_kernel(
     q_off = row_idx[:, None] * q_row_stride + tl.arange(0, BLOCK_K)[None, :]
     dmask = tl.arange(0, BLOCK_K) < d
     qmask = dmask[None, :] & (row_idx[:, None] < seqlen_q)
-    if IS_EVEN_MN & d == BLOCK_K:
+    if IS_EVEN_MN and (d == BLOCK_K):
         Q = tl.load(q_ptr + q_off, cache_modifier=".cg")
     else:
         Q = tl.load(q_ptr + q_off, mask=qmask, cache_modifier=".cg")
@@ -491,7 +491,7 @@ def flash_fwd_kernel(
             col_start = col_max - col_shift - BLOCK_N
             col_start = tl.multiple_of(col_start, BLOCK_N)
             off = col_start * k_row_stride
-            if IS_EVEN_MN & d == BLOCK_K:
+            if IS_EVEN_MN and (d == BLOCK_K):
                 K = tl.load(p_bk0 + off, cache_modifier=".cg")
                 if PRE_LOAD_V:
                     V = tl.load(p_bv0 + off, cache_modifier=".cg")
@@ -600,7 +600,7 @@ def flash_fwd_kernel(
 
             if not PRE_LOAD_V:
                 off = col_start * k_row_stride
-                if IS_EVEN_MN & d == BLOCK_K:
+                if IS_EVEN_MN and (d == BLOCK_K):
                     V = tl.load(p_bv0 + off, cache_modifier=".cg")
                 elif d == BLOCK_K:
                     kvmask = col_idx < seqlen_k
@@ -738,7 +738,7 @@ def flash_fwd_kernel(
     o_ptr += hid * o_head_stride
     o_offset = row_idx[:, None] * o_row_stride + tl.arange(0, BLOCK_K)
 
-    if IS_EVEN_MN & d == BLOCK_K:
+    if IS_EVEN_MN and (d == BLOCK_K):
         tl.store(o_ptr + o_offset, out)
     else:
         tl.store(o_ptr + o_offset, out, mask=qmask)
@@ -896,7 +896,7 @@ def flash_fwd_splitkv_kernel(
     p_qm = q_ptr + q_off
     dmask = tl.arange(0, BLOCK_K) < d
     qmask = dmask[None, :] & (row_idx[:, None] < seqlen_q)
-    if IS_EVEN_MN & BLOCK_K == d:
+    if IS_EVEN_MN and (BLOCK_K == d):
         Q = tl.load(p_qm, cache_modifier=".cg")
     else:
         Q = tl.load(p_qm, mask=qmask, cache_modifier=".cg")
@@ -983,7 +983,7 @@ def flash_fwd_splitkv_kernel(
             kv_off = n_block * BLOCK_N * k_row_stride
             col_idx = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
             row_idx = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-            if IS_EVEN_MN & d == BLOCK_K:
+            if IS_EVEN_MN and (d == BLOCK_K):
                 K = tl.load(p_k0 + kv_off, cache_modifier=".cg")
                 if PRE_LOAD_V:
                     V = tl.load(p_v0 + kv_off, cache_modifier=".cg")
@@ -1045,7 +1045,7 @@ def flash_fwd_splitkv_kernel(
             )
 
             if not PRE_LOAD_V:
-                if IS_EVEN_MN & d == BLOCK_K:
+                if IS_EVEN_MN and (d == BLOCK_K):
                     V = tl.load(p_v0 + kv_off, cache_modifier=".cg")
                 elif d == BLOCK_K:
                     V = tl.load(
@@ -1082,7 +1082,7 @@ def flash_fwd_splitkv_kernel(
     o_split_ptr = tl.multiple_of(o_split_ptr, d)
     p_om = o_split_ptr + o_split_offset
 
-    if IS_EVEN_MN & BLOCK_K == d:
+    if IS_EVEN_MN and (BLOCK_K == d):
         tl.store(p_om, acc_, cache_modifier=".cg")
     else:
         tl.store(p_om, acc_, mask=qmask, cache_modifier=".cg")

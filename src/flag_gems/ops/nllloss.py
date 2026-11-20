@@ -43,15 +43,15 @@ def nll_loss_forward_kernel(
     mask_n = offsets_n < N
 
     tgt = tl.load(tgt_ptr + offsets_n, mask=mask_n, other=0)
-    assert tgt >= 0 and tgt < C, "Invalid target value"
-    ignore_mask = not (tgt == ignore_index) and mask_n
+    assert ((tgt >= 0) & (tgt < C)) | (tgt == ignore_index) | (~mask_n), "Invalid target value"
+    ignore_mask = (tgt != ignore_index) & mask_n
 
     if wgt_ptr is None:
         wgt_tgt = ignore_mask.to(tl.float32)
     else:
         wgt_tgt = tl.load(wgt_ptr + tgt, mask=ignore_mask, other=0).to(tl.float32)
 
-    inp_tgt_ptrs = inp_ptr + offsets_n * C + tgt
+    inp_tgt_ptrs = inp_ptr + offsets_n.to(tl.int64) * C + tgt.to(tl.int64)
     inp_tgt = tl.load(inp_tgt_ptrs, mask=ignore_mask, other=0).to(tl.float32)
     out = inp_tgt * wgt_tgt * -1
 
@@ -64,12 +64,6 @@ def nll_loss_forward_kernel(
         total_wgt = tl.sum(wgt_tgt)
         tl.atomic_add(out_ptr, total_out, sem="relaxed")  # output
         tl.atomic_add(out_ptr + 1, total_wgt, sem="relaxed")  # weight
-        tl.atomic_add(out_ptr + 2, 1, sem="release")  # counter
-        counter = tl.load(out_ptr + 2)
-        if counter == tl.num_programs(0):
-            total_out = tl.load(out_ptr)
-            total_wgt = tl.load(out_ptr + 1)
-            tl.store(out_ptr + 3, total_out / total_wgt)
     # sum
     else:
         total_out = tl.sum(out)
@@ -96,7 +90,7 @@ def nll_loss_backward_kernel(
     mask_n = offsets_n < N
 
     tgt = tl.load(tgt_ptr + offsets_n, mask=mask_n, other=0)
-    ignore_mask = not (tgt == ignore_index) and mask_n
+    ignore_mask = (tgt != ignore_index) & mask_n
 
     if wgt_ptr is None:
         wgt_tgt = ignore_mask.to(tl.float32)
@@ -114,8 +108,8 @@ def nll_loss_backward_kernel(
         total_w = 1
 
     inp_grad = tl.where(ignore_mask, -1 * out_grad * wgt_tgt / total_w, 0)
-    inp_grad_ptrs = inp_grad_ptr + offsets_n * C + tgt
-    tl.store(inp_grad_ptrs, inp_grad, mask=mask_n)
+    inp_grad_ptrs = inp_grad_ptr + offsets_n.to(tl.int64) * C + tgt.to(tl.int64)
+    tl.store(inp_grad_ptrs, inp_grad, mask=ignore_mask)
 
 
 @libentry()
@@ -141,21 +135,21 @@ def nll_loss2d_forward_kernel(
 
     tgt_ptrs = tgt_ptr + offset_n * D + offset_d
     tgt = tl.load(tgt_ptrs, mask=mask_block, other=0)
-    assert tgt >= 0 and tgt < C, "Invalid target value"
-    ignore_mask = not (tgt == ignore_index) and mask_block
+    assert ((tgt >= 0) & (tgt < C)) | (tgt == ignore_index) | (~mask_block), "Invalid target value"
+    ignore_mask = (tgt != ignore_index) & mask_block
 
     if wgt_ptr is None:
         wgt_tgt = ignore_mask.to(tl.float32)
     else:
         wgt_tgt = tl.load(wgt_ptr + tgt, mask=ignore_mask, other=0).to(tl.float32)
 
-    inp_tgt_ptrs = inp_ptr + offset_n * C * D + tgt * D + offset_d
+    inp_tgt_ptrs = inp_ptr + offset_n.to(tl.int64) * C * D + tgt.to(tl.int64) * D + offset_d
     inp_tgt = tl.load(inp_tgt_ptrs, mask=ignore_mask, other=0).to(tl.float32)
     out = inp_tgt * wgt_tgt * -1
 
     # none
     if reduction == 0:
-        out_ptrs = out_ptr + offset_n * D + offset_d
+        out_ptrs = out_ptr + offset_n.to(tl.int64) * D + offset_d
         tl.store(out_ptrs, out, mask=mask_block)
     # mean
     elif reduction == 1:
@@ -163,12 +157,6 @@ def nll_loss2d_forward_kernel(
         total_wgt = tl.sum(wgt_tgt)
         tl.atomic_add(out_ptr, total_out, sem="relaxed")  # output
         tl.atomic_add(out_ptr + 1, total_wgt, sem="relaxed")  # weight
-        tl.atomic_add(out_ptr + 2, 1, sem="release")  # counter
-        counter = tl.load(out_ptr + 2)
-        if counter == tl.num_programs(0):
-            total_out = tl.load(out_ptr)
-            total_wgt = tl.load(out_ptr + 1)
-            tl.store(out_ptr + 3, total_out / total_wgt)
     # sum
     else:
         total_out = tl.sum(out)
@@ -199,7 +187,7 @@ def nll_loss2d_backward_kernel(
 
     tgt_ptrs = tgt_ptr + offset_n * D + offset_d
     tgt = tl.load(tgt_ptrs, mask=mask_block, other=0)
-    ignore_mask = not (tgt == ignore_index) and mask_block
+    ignore_mask = (tgt != ignore_index) & mask_block
 
     if wgt_ptr is None:
         wgt_tgt = ignore_mask.to(tl.float32)
@@ -217,8 +205,8 @@ def nll_loss2d_backward_kernel(
     else:
         total_w = 1
     inp_grad = tl.where(ignore_mask, -1 * out_grad * wgt_tgt / total_w, 0)
-    inp_grad_ptrs = inp_grad_ptr + offset_n * C * D + tgt * D + offset_d
-    tl.store(inp_grad_ptrs, inp_grad, mask=mask_block)
+    inp_grad_ptrs = inp_grad_ptr + offset_n.to(tl.int64) * C * D + tgt.to(tl.int64) * D + offset_d
+    tl.store(inp_grad_ptrs, inp_grad, mask=ignore_mask)
 
 
 # Negative Log Likelihood Loss (NLLLoss)
@@ -269,13 +257,7 @@ def nll_loss2d_forward_raw(self, target, weight=None, reduction=1, ignore_index=
     if reduction == 0:
         out = torch.empty(shape, dtype=self.dtype, device=self.device)
     elif reduction == 1:
-        out = torch.zeros(
-            [
-                4,
-            ],
-            dtype=torch.float32,
-            device=self.device,
-        )
+        out = torch.zeros([2], dtype=torch.float32, device=self.device)
     else:
         out = torch.zeros([], dtype=torch.float32, device=self.device)
 
@@ -290,9 +272,8 @@ def nll_loss2d_forward_raw(self, target, weight=None, reduction=1, ignore_index=
         output = out
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
     elif reduction == 1:
-        out = out.to(self.dtype)
-        output = out[3]
-        total_weight = out[1]
+        output = (out[0] / out[1]).to(self.dtype)
+        total_weight = out[1].to(self.dtype)
     else:
         output = out.to(self.dtype)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
@@ -456,13 +437,7 @@ def nll_loss_forward_raw(self, target, weight=None, reduction=1, ignore_index=-1
     if reduction == 0:
         out = torch.empty(shape, dtype=self.dtype, device=self.device)
     elif reduction == 1:
-        out = torch.zeros(
-            [
-                4,
-            ],
-            dtype=torch.float32,
-            device=self.device,
-        )
+        out = torch.zeros([2], dtype=torch.float32, device=self.device)
     else:
         out = torch.zeros([], dtype=torch.float32, device=self.device)
 
@@ -484,9 +459,8 @@ def nll_loss_forward_raw(self, target, weight=None, reduction=1, ignore_index=-1
         output = out
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
     elif reduction == 1:
-        out = out.to(self.dtype)
-        output = out[3]
-        total_weight = out[1]
+        output = (out[0] / out[1]).to(self.dtype)
+        total_weight = out[1].to(self.dtype)
     else:
         output = out.to(self.dtype)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)

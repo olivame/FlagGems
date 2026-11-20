@@ -247,10 +247,11 @@ def cumsum_wrapper(inp, dim=1, dtype=None, out=None):
     if inp.dtype == torch.float16 or inp.dtype == torch.bfloat16:
         compute_dtype = torch.float32
 
-    if K == 1:  # row scan
-        reduce_then_scan_row(inp, out, M, N, compute_dtype)
-    else:  # col scan
-        scan_then_fan(inp, out, M, N, K, compute_dtype)
+    with torch_device_fn.device(inp.device):
+        if K == 1:  # row scan
+            reduce_then_scan_row(inp, out, M, N, compute_dtype)
+        else:  # col scan
+            scan_then_fan(inp, out, M, N, K, compute_dtype)
 
     return out
 

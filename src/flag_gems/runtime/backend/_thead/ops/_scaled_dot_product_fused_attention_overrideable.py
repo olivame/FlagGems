@@ -344,7 +344,12 @@ def _scaled_dot_product_fused_attention_overrideable(
     # (S==64: w4,s2; S==128: w8,s3); L>=256 -> (64,64,w4,s3)
     # fp32:   L<=64 -> (64,64,w8,s3); L==128 -> (64,128|64,w8,s3); L>=256 -> (64,128,w8,s3)
     is_16b = q.dtype in (torch.float16, torch.bfloat16)
-    if L <= 64:
+    bucketing = bool(getattr(triton.knobs.autotuning, "shape_bucketing", False))
+    if bucketing:
+        BLOCK_M, BLOCK_N = 64, (64 if is_16b else 128)
+        num_warps = 4 if is_16b else 8
+        num_stages = 3
+    elif L <= 64:
         BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 8, 3
     elif L <= 128:
         if is_16b:
@@ -370,7 +375,8 @@ def _scaled_dot_product_fused_attention_overrideable(
         bias_ptr = q
 
     if (
-        q.is_contiguous()
+        not bucketing
+        and q.is_contiguous()
         and k.is_contiguous()
         and v.is_contiguous()
         and out.is_contiguous()

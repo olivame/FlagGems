@@ -34,14 +34,14 @@ def embedding_kernel(
     N: tl.constexpr,  # number of columns in X
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = ext.program_id(0)
+    pid = ext.program_id(0).to(tl.int64)
     out_ptr += pid * N
     in_ptr += pid
 
     mask = tl.arange(0, BLOCK_SIZE) < N
     cols = tl.arange(0, BLOCK_SIZE)
 
-    row_idx = tl.load(in_ptr)
+    row_idx = tl.load(in_ptr).to(tl.int64)
     weight_ptr += row_idx * N
     embedding_weight = tl.load(weight_ptr + cols, mask, other=0.0)
     tl.store(out_ptr + cols, embedding_weight, mask)
@@ -76,14 +76,14 @@ def embedding_backward_kernel(
     N: tl.constexpr,  # number of columns in X
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = ext.program_id(0)
+    pid = ext.program_id(0).to(tl.int64)
     grad_out += pid * N
     indices += pid
 
     mask = tl.arange(0, BLOCK_SIZE) < N
     cols = tl.arange(0, BLOCK_SIZE)
 
-    row_idx = tl.load(indices).to(tl.int32)
+    row_idx = tl.load(indices).to(tl.int64)
     if not HAS_PADDING_IDX:
         grad_in += row_idx * N
         embedding_grad = tl.load(grad_out + cols, mask, other=0.0)
@@ -154,6 +154,8 @@ def embedding_backward(
     logger.debug("GEMS EMBEDDING_BACKWARD")
     assert not sparse, "Currently do not support sparse format"
 
+    grad_outputs = grad_outputs.contiguous()
+    indices = indices.contiguous()
     M = indices.numel()
     N = grad_outputs.shape[-1]
 
