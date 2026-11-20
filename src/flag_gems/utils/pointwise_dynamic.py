@@ -262,6 +262,11 @@ class FunctionSchema:
         return self.signature(outputs_in_arg=False)
 
 
+def _is_shape_bucketing_enabled() -> bool:
+    autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
+    return bool(autotuning is not None and getattr(autotuning, "shape_bucketing", False))
+
+
 class KernelGenerator:
     def __init__(
         self,
@@ -270,12 +275,14 @@ class KernelGenerator:
         rank: int,
         name: str,
         config: CodeGenConfig,
+        dynamic_strides: bool = False,
     ):
         self.fx = function_schema
         self.fn = scalar_fn
         self.ndim = rank
         self.name = name
         self.config = config
+        self.dynamic_strides = dynamic_strides
 
         self.fn_name = scalar_fn.__name__
         self.fn_module = scalar_fn.__module__
@@ -338,11 +345,12 @@ class KernelGenerator:
 
             # signature: strides, for each tensor arguments
             ndim = self.ndim
+            stride_ty = "int" if self.dynamic_strides else "tl.constexpr"
             if ndim > 0:
                 # strides for inputs
                 for i in range(schema.num_input_tensors()):
                     stride_args = _cs(
-                        f"in{i}_stride{j}: tl.constexpr" for j in range(ndim)
+                        f"in{i}_stride{j}: {stride_ty}" for j in range(ndim)
                     )
                     code.writeline(f"{stride_args}, # strides for in{i}")
                     if with_block_pointer:
@@ -354,7 +362,7 @@ class KernelGenerator:
                 # strides for outputs
                 for i in range(schema.num_output_tensors()):
                     stride_args = _cs(
-                        f"out{i}_stride{j}: tl.constexpr" for j in range(ndim)
+                        f"out{i}_stride{j}: {stride_ty}" for j in range(ndim)
                     )
                     code.writeline(f"{stride_args}, # strides for out{i}")
                     if with_block_pointer:
@@ -798,12 +806,14 @@ class WrapperGenerator:
         ndim: int,
         name: str,
         config: CodeGenConfig,
+        dynamic_strides: bool = False,
     ):
         self.fx = function_schema
         self.jit_fn_name = jit_fn_name
         self.ndim = ndim
         self.name = name
         self.config = config
+        self.dynamic_strides = dynamic_strides
 
     def input_name(self, i):
         is_tensor = self.fx.is_tensor(i)
@@ -915,7 +925,10 @@ class WrapperGenerator:
 
                 code.writeline("tiles_per_cta = triton.cdiv(num_tiles, num_ctas)")
             code.writeline("num_warps = heuristics_for_num_warps(tile_size)")
-            code.writeline("one_tile_per_cta = tiles_per_cta==1")
+            if self.dynamic_strides:
+                code.writeline("one_tile_per_cta = False")
+            else:
+                code.writeline("one_tile_per_cta = tiles_per_cta==1")
         code.writeline("grid = (num_ctas, 1, 1)")
 
     def gen_task_partition_1d(self, code: IndentedBuffer):
@@ -957,7 +970,10 @@ class WrapperGenerator:
 
                 code.writeline("tiles_per_cta = triton.cdiv(num_tiles, num_ctas)")
             code.writeline("num_warps = heuristics_for_num_warps(tile_size)")
-            code.writeline("one_tile_per_cta = tiles_per_cta==1")
+            if self.dynamic_strides:
+                code.writeline("one_tile_per_cta = False")
+            else:
+                code.writeline("one_tile_per_cta = tiles_per_cta==1")
         code.writeline("grid = (num_ctas, 1, 1)")
 
     def gen_kernel_launch(
@@ -1118,14 +1134,26 @@ class ModuleGenerator:
         jit_fn_name: str,
         wrapper_name: str,
         config: CodeGenConfig,
+        dynamic_strides: bool = False,
     ):
         self.config = config
         self.scalar_fn = scalar_fn
+        self.dynamic_strides = dynamic_strides
         self.wrapper_gen = WrapperGenerator(
-            function_schema, jit_fn_name, ndim, wrapper_name, config
+            function_schema,
+            jit_fn_name,
+            ndim,
+            wrapper_name,
+            config,
+            dynamic_strides=dynamic_strides,
         )
         self.kernel_gen = KernelGenerator(
-            function_schema, scalar_fn, ndim, jit_fn_name, config
+            function_schema,
+            scalar_fn,
+            ndim,
+            jit_fn_name,
+            config,
+            dynamic_strides=dynamic_strides,
         )
 
     @staticmethod
@@ -1777,7 +1805,9 @@ class PointwiseDynamicFunction:
             return item.unwrap()
         return tuple(item.unwrap() for item in tensors)
 
-    def _compute_kernel_names(self, ndim: int) -> Tuple[str, str, str]:
+    def _compute_kernel_names(
+        self, ndim: int, *, dynamic_strides: Optional[bool] = None
+    ) -> Tuple[str, str, str]:
         """Compute kernel name, wrapper name, and file path for a given ndim.
 
         This is the single source of truth for naming, used by both instantiate()
@@ -1786,9 +1816,12 @@ class PointwiseDynamicFunction:
         Returns:
             Tuple of (kernel_name, wrapper_name, file_path)
         """
+        if dynamic_strides is None:
+            dynamic_strides = _is_shape_bucketing_enabled()
         scalar_fn_name = self._scalar_fn.__name__
-        kernel_name = f"{scalar_fn_name}_kernel_rank_{ndim}"
-        wrapper_name = f"{scalar_fn_name}_wrapper_rank_{ndim}"
+        bkt_suffix = "_bkt" if dynamic_strides else ""
+        kernel_name = f"{scalar_fn_name}_kernel_rank_{ndim}{bkt_suffix}"
+        wrapper_name = f"{scalar_fn_name}_wrapper_rank_{ndim}{bkt_suffix}"
 
         file_name = (
             f"pointwise_dynamic_{self._scalar_fn_cache_key}_{kernel_name}_"
@@ -1806,14 +1839,17 @@ class PointwiseDynamicFunction:
         # NOTE: manually instantiated overload does not have `prepare_args` as
         # preprocessing, so you have to manually allocate output and make sure that
         # the inputs & ouputs actually fits the manually instantiated overload
-        key = f"{ndim}_{self.config.prefer_block_pointer}_{self.config.balance_grid}"
+        dynamic_strides = _is_shape_bucketing_enabled()
+        key = f"{ndim}_{self.config.prefer_block_pointer}_{self.config.balance_grid}_{int(dynamic_strides)}"
         if key in self.overloads:
             return self.overloads[key]
 
         code = IndentedBuffer()
 
         # Use helper to compute names (single source of truth)
-        kernel_name, wrapper_name, file_path = self._compute_kernel_names(ndim)
+        kernel_name, wrapper_name, file_path = self._compute_kernel_names(
+            ndim, dynamic_strides=dynamic_strides
+        )
 
         module_gen = ModuleGenerator(
             self.fx,
@@ -1822,6 +1858,7 @@ class PointwiseDynamicFunction:
             kernel_name,
             wrapper_name,
             self.config,
+            dynamic_strides=dynamic_strides,
         )
         module_gen.codegen(code)
 
@@ -1836,7 +1873,7 @@ class PointwiseDynamicFunction:
 
         # load
         spec = importlib.util.spec_from_file_location(
-            f"_gen_module_{self._scalar_fn_cache_key}_rank_{ndim}",
+            f"_gen_module_{self._scalar_fn_cache_key}_rank_{ndim}{'_bkt' if dynamic_strides else ''}",
             file_path,
         )
         m = importlib.util.module_from_spec(spec)
