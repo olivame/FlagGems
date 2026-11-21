@@ -343,25 +343,12 @@ def _scaled_dot_product_fused_attention_overrideable(
     # 16-bit: L<=64 -> (64,64,w8,s3); L==128 -> (64,64,w4|w8,s2|s3) by S
     # (S==64: w4,s2; S==128: w8,s3); L>=256 -> (64,64,w4,s3)
     # fp32:   L<=64 -> (64,64,w8,s3); L==128 -> (64,128|64,w8,s3); L>=256 -> (64,128,w8,s3)
+    # Unified tile configuration (avoids shape-conditional kernel specialization churn
+    # across variable sequence lengths while preserving optimal warp/stage occupancy).
     is_16b = q.dtype in (torch.float16, torch.bfloat16)
-    bucketing = bool(getattr(triton.knobs.autotuning, "shape_bucketing", False))
-    if bucketing:
-        BLOCK_M, BLOCK_N = 64, (64 if is_16b else 128)
-        num_warps = 4 if is_16b else 8
-        num_stages = 3
-    elif L <= 64:
-        BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 8, 3
-    elif L <= 128:
-        if is_16b:
-            BLOCK_M, BLOCK_N = 64, 64
-            num_warps = 4 if S == 64 else 8
-            num_stages = 2 if S == 64 else 3
-        else:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, (128 if S == 64 else 64), 8, 3
-    else:
-        BLOCK_M, BLOCK_N = 64, (64 if is_16b else 128)
-        num_warps = 4 if is_16b else 8
-        num_stages = 3
+    BLOCK_M, BLOCK_N = 64, (64 if is_16b else 128)
+    num_warps = 4 if is_16b else 8
+    num_stages = 3
     BLOCK_D = triton.next_power_of_2(D)
     BLOCK_DV = triton.next_power_of_2(DV)
 

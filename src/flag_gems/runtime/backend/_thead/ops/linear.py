@@ -366,7 +366,7 @@ def linear(input, weight, bias=None):
     K = input.shape[-1]
     N = weight.shape[0]
 
-    input_flat = input.view(-1, K)
+    input_flat = input.reshape(-1, K)
     M = input_flat.shape[0]
 
     post_bias = None
@@ -377,7 +377,7 @@ def linear(input, weight, bias=None):
 
     if input.dtype == torch.float32 and M <= _gemv_max_m(N, K):
         output = _linear_gemv(input_flat, weight, bias, M, K, N)
-        output = output.view(*batch_dims, N)
+        output = output.reshape(*batch_dims, N)
         if single_1d:
             output = output.squeeze(0)
         if post_bias is not None:
@@ -417,7 +417,7 @@ def linear(input, weight, bias=None):
             BIAS=bias is not None,
         )
 
-    output = output.view(*batch_dims, N)
+    output = output.reshape(*batch_dims, N)
 
     if single_1d:
         output = output.squeeze(0)
