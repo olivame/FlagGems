@@ -37,7 +37,6 @@ from .gemm_utils import (
     _PPU_SMS,
     EXPAND_CONFIG_FILENAME,
     HAS_PPU_TLE,
-    _aiu_load_mask,
     _configs_from_specs,
     _output_overlaps_inputs,
     _ppu_bucket_strategy,
@@ -155,8 +154,9 @@ def _ppu_bmm_configs():
         (64, 512, 32, 8, 4, 8, _LOAD_REGULAR),
         (128, 64, 64, 4, 5, 1, _LOAD_BOTH_AIU),
     )
+    regular_specs = tuple((*spec[:-1], _LOAD_REGULAR) for spec in specs)
     return _configs_from_specs(
-        specs,
+        regular_specs,
         (
             "BLOCK_M",
             "BLOCK_N",
@@ -181,8 +181,9 @@ def _ppu_bmm_narrow_n_configs():
         (256, 64, 64, 8, 3, 1, _LOAD_REGULAR),
         (512, 64, 32, 8, 4, 1, _LOAD_REGULAR),
     )
+    regular_specs = tuple((*spec[:-1], _LOAD_REGULAR) for spec in specs)
     return _configs_from_specs(
-        specs,
+        regular_specs,
         (
             "BLOCK_M",
             "BLOCK_N",
@@ -195,9 +196,26 @@ def _ppu_bmm_narrow_n_configs():
     )
 
 
+def _regular_load_configs(configs):
+    """Deduplicate configs after normalizing LOAD_MODE to _LOAD_REGULAR."""
+    out = []
+    seen = set()
+    for cfg in configs:
+        kw = dict(cfg.kwargs)
+        kw["LOAD_MODE"] = _LOAD_REGULAR
+        key = (tuple(sorted(kw.items())), cfg.num_warps, cfg.num_stages)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            triton.Config(kw, num_warps=cfg.num_warps, num_stages=cfg.num_stages)
+        )
+    return out
+
+
 def _ppu_small_m_bmm_configs():
-    """The batched BM16 kernel accepts exactly the MM BM16 candidates."""
-    return _ppu_small_m_configs()
+    """The batched BM16 kernel reuses MM BM16 tiles with alignment-safe loads."""
+    return _regular_load_configs(_ppu_small_m_configs())
 
 
 def _ppu_multi_row_bmm_configs():
@@ -219,8 +237,8 @@ def _ppu_split_k_bmm_configs():
         (4, 64, 256, 64, 4, 4, _LOAD_REGULAR, False),
         (2, 128, 128, 32, 4, 4, _LOAD_REGULAR, False),
         (4, 128, 128, 32, 4, 4, _LOAD_REGULAR, False),
-        (2, 64, 256, 32, 4, 4, _LOAD_A_AIU, False),
-        (4, 64, 256, 32, 4, 4, _LOAD_A_AIU, False),
+        (2, 64, 256, 32, 4, 4, _LOAD_REGULAR, False),
+        (4, 64, 256, 32, 4, 4, _LOAD_REGULAR, False),
     )
     return _configs_from_specs(
         specs,
@@ -237,9 +255,24 @@ def _ppu_split_k_bmm_configs():
     )
 
 
+def _prune_bmm_configs(configs, named_args, **kwargs):
+    """Keep alignment-agnostic regular-load BMM candidates across alignments."""
+    args = dict(named_args)
+    args["aiu_load_mask"] = 0
+    return _prune_gemm_configs(configs, args, **kwargs)
+
+
+def _prune_bmm_split_k_configs(configs, named_args, **kwargs):
+    """Keep alignment-agnostic regular-load split-K BMM candidates."""
+    args = dict(named_args)
+    args["aiu_load_mask"] = 0
+    return _prune_split_k_configs(configs, args, **kwargs)
+
+
 def _prune_bmm_small_m_configs(configs, named_args, **kwargs):
     """Apply GEMM legality to a masked BM16 tile, including scalar M."""
     args = dict(named_args)
+    args["aiu_load_mask"] = 0
     if args.get("M") is not None:
         # BM16 uses MASK_M=True and is valid with fewer than four rows. The
         # generic BM>=32 underfill rule would otherwise reject every config
@@ -580,7 +613,6 @@ if HAS_PPU_TLE:
             "FUSE_BIAS",
             "READ_BIAS",
             "B_TRANSPOSED",
-            "aiu_load_mask",
             "batch",
             "M",
             "N",
@@ -590,13 +622,12 @@ if HAS_PPU_TLE:
             "default",
             "default",
             "default",
-            "default",
             _ppu_bucket_strategy,
             _ppu_bucket_strategy,
             _ppu_bucket_strategy,
             _ppu_reduction_bucket_strategy,
         ],
-        prune_configs_by={"early_config_prune": _prune_gemm_configs},
+        prune_configs_by={"early_config_prune": _prune_bmm_configs},
         warmup=5,
         rep=10,
         flagtune_op_name="bmm",
@@ -640,7 +671,6 @@ if HAS_PPU_TLE:
         stride_bias_m,
         stride_bias_n,
         B_TRANSPOSED: tl.constexpr,
-        aiu_load_mask: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -695,17 +725,7 @@ if HAS_PPU_TLE:
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
-            # Modes 0/1/2 require both/A/B AIU respectively; 3 is regular.
-            (
-                LOAD_MODE
-                if (
-                    LOAD_MODE == 3
-                    or (LOAD_MODE == 0 and aiu_load_mask == 3)
-                    or (LOAD_MODE == 1 and aiu_load_mask & 1)
-                    or (LOAD_MODE == 2 and aiu_load_mask & 2)
-                )
-                else 3
-            ),
+            3,
             B_TRANSPOSED,
             PIPE_STAGES,
             False,
@@ -728,7 +748,6 @@ if HAS_PPU_TLE:
             "FUSE_BIAS",
             "READ_BIAS",
             "B_TRANSPOSED",
-            "aiu_load_mask",
             "batch",
             "M",
             "N",
@@ -738,13 +757,12 @@ if HAS_PPU_TLE:
             "default",
             "default",
             "default",
-            "default",
             _ppu_bucket_strategy,
             _ppu_bucket_strategy,
             _ppu_bucket_strategy,
             _ppu_reduction_bucket_strategy,
         ],
-        prune_configs_by={"early_config_prune": _prune_gemm_configs},
+        prune_configs_by={"early_config_prune": _prune_bmm_configs},
         warmup=5,
         rep=10,
         flagtune_op_name="bmm",
@@ -788,7 +806,6 @@ if HAS_PPU_TLE:
         stride_bias_m,
         stride_bias_n,
         B_TRANSPOSED: tl.constexpr,
-        aiu_load_mask: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -843,17 +860,7 @@ if HAS_PPU_TLE:
             BLOCK_M,
             BLOCK_N,
             BLOCK_K,
-            # Modes 0/1/2 require both/A/B AIU respectively; 3 is regular.
-            (
-                LOAD_MODE
-                if (
-                    LOAD_MODE == 3
-                    or (LOAD_MODE == 0 and aiu_load_mask == 3)
-                    or (LOAD_MODE == 1 and aiu_load_mask & 1)
-                    or (LOAD_MODE == 2 and aiu_load_mask & 2)
-                )
-                else 3
-            ),
+            3,
             B_TRANSPOSED,
             PIPE_STAGES,
             False,
@@ -876,14 +883,12 @@ if HAS_PPU_TLE:
             "FUSE_BIAS",
             "READ_BIAS",
             "B_TRANSPOSED",
-            "aiu_load_mask",
             "batch",
             "M",
             "N",
             "K",
         ],
         strategy=[
-            "default",
             "default",
             "default",
             "default",
@@ -901,9 +906,11 @@ if HAS_PPU_TLE:
     )
     @triton.heuristics(
         values={
+            "EVEN_K": _even_k_128,
             "FULL_K_TILES": _full_k_tiles,
             "FULL_M_TILES": _full_m_tiles,
             "FULL_N_TILES": _full_n_tiles,
+            "EVEN_N": _even_n_1024,
         }
     )
     @triton.jit(do_not_specialize=["alpha", "beta"])
@@ -931,7 +938,6 @@ if HAS_PPU_TLE:
         stride_bias_m,
         stride_bias_n,
         B_TRANSPOSED: tl.constexpr,
-        aiu_load_mask: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         LOAD_MODE: tl.constexpr,
@@ -977,18 +983,7 @@ if HAS_PPU_TLE:
             16,
             BLOCK_N,
             BLOCK_K,
-            # The guard also protects launches using a previously cached
-            # tuner winner from before the stricter small-M pruning rule.
-            (
-                LOAD_MODE
-                if (
-                    LOAD_MODE == 3
-                    or (LOAD_MODE == 0 and aiu_load_mask == 3)
-                    or (LOAD_MODE == 1 and aiu_load_mask & 1)
-                    or (LOAD_MODE == 2 and aiu_load_mask & 2)
-                )
-                else 3
-            ),
+            3,
             B_TRANSPOSED,
             PIPE_STAGES,
             True,
@@ -1007,16 +1002,15 @@ if HAS_PPU_TLE:
     @libentry()
     @libtuner(
         configs=_ppu_split_k_bmm_configs(),
-        key=["B_TRANSPOSED", "aiu_load_mask", "batch", "M", "N", "K"],
+        key=["B_TRANSPOSED", "batch", "M", "N", "K"],
         strategy=[
-            "default",
             "default",
             _ppu_bucket_strategy,
             _ppu_bucket_strategy,
             _ppu_bucket_strategy,
             _ppu_reduction_bucket_strategy,
         ],
-        prune_configs_by={"early_config_prune": _prune_split_k_configs},
+        prune_configs_by={"early_config_prune": _prune_bmm_split_k_configs},
         warmup=5,
         rep=10,
         flagtune_op_name="bmm",
@@ -1039,7 +1033,6 @@ if HAS_PPU_TLE:
         stride_bk,
         stride_bn,
         B_TRANSPOSED: tl.constexpr,
-        aiu_load_mask: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -1047,7 +1040,6 @@ if HAS_PPU_TLE:
         INTERLEAVED: tl.constexpr,
         LOAD_MODE: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
-        EVEN_MN: tl.constexpr,
     ):
         """Write FP32 batched K slices without output atomics."""
         # Keep the split dimension in program_id(0); the PPU compiler's
@@ -1097,11 +1089,7 @@ if HAS_PPU_TLE:
                 block_shape=(BLOCK_K, BLOCK_N),
                 order=(1, 0),
             )
-        load_mode = (
-            LOAD_MODE
-            if (LOAD_MODE == 3 or (LOAD_MODE == 1 and aiu_load_mask & 1))
-            else 3
-        )
+        load_mode = 3
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k_offset in tl.range(0, k_per_split, BLOCK_K, num_stages=PIPE_STAGES):
             if INTERLEAVED:
@@ -1140,10 +1128,7 @@ if HAS_PPU_TLE:
             + offs_n[None, :]
         )
         mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        if EVEN_MN:
-            tl.store(workspace_ptrs, acc)
-        else:
-            tl.store(workspace_ptrs, acc, mask=mask)
+        tl.store(workspace_ptrs, acc, mask=mask)
 
     @libtuner(
         configs=_ppu_split_k_bmm_reduce_configs(),
@@ -1181,7 +1166,6 @@ if HAS_PPU_TLE:
         SPLIT_K: tl.constexpr,
         BLOCK: tl.constexpr,
         VEC: tl.constexpr,
-        EVEN_N: tl.constexpr,
         FUSE_BIAS: tl.constexpr,
         READ_BIAS: tl.constexpr,
     ):
@@ -1200,10 +1184,7 @@ if HAS_PPU_TLE:
         )
         acc = tl.zeros((BLOCK, VEC), dtype=tl.float32)
         for _ in range(SPLIT_K):
-            if EVEN_N:
-                acc += tl.load(workspace_ptrs)
-            else:
-                acc += tl.load(workspace_ptrs, mask=mask, other=0.0)
+            acc += tl.load(workspace_ptrs, mask=mask, other=0.0)
             workspace_ptrs += matrix_elements
 
         offs_m = matrix_offsets // N
@@ -1219,10 +1200,7 @@ if HAS_PPU_TLE:
             )
             bias_value = tl.load(bias_ptrs, mask=mask, other=0.0)
             acc += beta * bias_value
-        if EVEN_N:
-            tl.store(c_ptrs, acc.to(C.dtype.element_ty))
-        else:
-            tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=mask)
+        tl.store(c_ptrs, acc.to(C.dtype.element_ty), mask=mask)
 
 
 def _can_use_ppu_bmm_inputs(A: torch.Tensor, B: torch.Tensor) -> bool:
@@ -1357,7 +1335,6 @@ def _run_ppu_bmm_reduce(workspace, out, bias, alpha, beta, split_k, fuse_bias):
             SPLIT_K=split_k,
             FUSE_BIAS=fuse_bias,
             READ_BIAS=fuse_bias and beta != 0,
-            EVEN_N=False,
         )
     return out
 
@@ -1456,9 +1433,6 @@ def _launch_ppu_bmm_small_m(A, B, out, bias, alpha, beta, fuse_bias, *, b_transp
             bias.stride(1),
             bias.stride(2),
             B_TRANSPOSED=b_transposed,
-            aiu_load_mask=_aiu_load_mask(A, B),
-            EVEN_K=K % 128 == 0,
-            EVEN_N=N % 1024 == 0,
             FUSE_BIAS=fuse_bias,
             READ_BIAS=read_bias,
         )
@@ -1652,7 +1626,6 @@ def _run_ppu_bmm_main(
                     gemm_bias.stride(1),
                     gemm_bias.stride(2),
                     B_TRANSPOSED=b_transposed,
-                    aiu_load_mask=_aiu_load_mask(A, b_chunk),
                     FUSE_BIAS=fuse_bias and not separate_epilogue,
                     READ_BIAS=read_bias and not separate_epilogue,
                 )
@@ -1694,7 +1667,6 @@ def _run_ppu_bmm_main(
             bias.stride(1),
             bias.stride(2),
             B_TRANSPOSED=b_transposed,
-            aiu_load_mask=_aiu_load_mask(A, B),
             FUSE_BIAS=fuse_bias,
             READ_BIAS=read_bias,
         )
@@ -1732,8 +1704,6 @@ def _run_ppu_bmm_split_k(A, B, out, bias, alpha, beta, fuse_bias):
             *A.stride(),
             *B.stride(),
             B_TRANSPOSED=_b_transposed_layout(B),
-            aiu_load_mask=_aiu_load_mask(A, B),
-            EVEN_MN=False,
         )
         # A warm LibEntry launch does not update the tuner's best_config.
         # Its returned metadata belongs to this exact cached kernel/shape.

@@ -1288,9 +1288,11 @@ if HAS_PPU_TLE:
     )
     @triton.heuristics(
         values={
+            "EVEN_K": _even_k_128,
             "FULL_K_TILES": _full_k_tiles,
             "FULL_M_TILES": _full_m_tiles,
             "FULL_N_TILES": _full_n_tiles,
+            "EVEN_N": _even_n_1024,
         }
     )
     @triton.jit
@@ -1409,9 +1411,11 @@ if HAS_PPU_TLE:
     )
     @triton.heuristics(
         values={
+            "EVEN_K": _even_k_128,
             "FULL_K_TILES": _full_k_tiles,
             "FULL_M_TILES": _full_m_tiles,
             "FULL_N_TILES": _full_n_tiles,
+            "EVEN_N": _even_n_1024,
         }
     )
     @triton.jit
@@ -1655,7 +1659,6 @@ if HAS_PPU_TLE:
         INTERLEAVED: tl.constexpr,
         LOAD_MODE: tl.constexpr,
         PIPE_STAGES: tl.constexpr,
-        EVEN_MN: tl.constexpr,
     ):
         # PPU's legacy divergence pass crashes on this kernel when split-K is
         # represented by ctaid.y. Pack (split, output tile) into ctaid.x; this
@@ -1749,10 +1752,7 @@ if HAS_PPU_TLE:
             + offs_m[:, None] * N
             + offs_n[None, :]
         )
-        if EVEN_MN:
-            tl.store(workspace_ptrs, acc)
-        else:
-            tl.store(workspace_ptrs, acc, mask=mask)
+        tl.store(workspace_ptrs, acc, mask=mask)
 
     @libentry(cache_binding=True)
     @libtuner(
@@ -2291,8 +2291,6 @@ def _run_partial_m_ppu_mm(
             expanded_bias.stride(1),
             B_TRANSPOSED=_b_transposed_layout(b),
             aiu_load_mask=_aiu_load_mask(a, b),
-            EVEN_K=K % 128 == 0,
-            EVEN_N=N % 1024 == 0,
             FUSE_ADDMM=fuse_addmm,
             READ_BIAS=fuse_addmm and beta != 0,
             **partial_meta,
@@ -2467,7 +2465,6 @@ def _run_split_k_mm(
             b.stride(1),
             B_TRANSPOSED=b_transposed,
             aiu_load_mask=_aiu_load_mask(a, b),
-            EVEN_MN=False,
         )
         # A warm LibEntry launch does not update the tuner's best_config.
         # Its returned metadata belongs to this exact cached kernel/shape.

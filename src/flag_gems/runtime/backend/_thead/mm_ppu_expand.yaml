@@ -415,7 +415,6 @@ bmm_ppu:
       FUSE_BIAS: default
       READ_BIAS: default
       B_TRANSPOSED: default
-      aiu_load_mask: default
       batch: default
       M: default
       N: default
@@ -460,7 +459,6 @@ bmm_ppu_narrow_n:
       FUSE_BIAS: default
       READ_BIAS: default
       B_TRANSPOSED: default
-      aiu_load_mask: default
       batch: default
       M: default
       N: default
@@ -565,7 +563,6 @@ bmm_ppu_small_m:
       FUSE_BIAS: default
       READ_BIAS: default
       B_TRANSPOSED: default
-      aiu_load_mask: default
       batch: default
       M: default
       N: default
@@ -634,7 +631,6 @@ bmm_ppu_split_k:
     warps: [4]
   - strategy:
       B_TRANSPOSED: default
-      aiu_load_mask: default
       batch: default
       M: default
       N: default

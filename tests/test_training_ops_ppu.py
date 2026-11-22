@@ -466,6 +466,72 @@ def test_bmm_split_k_warm_cache_uses_launch_meta():
     print("  bmm split-K launch_meta OK")
 
 
+
+def test_jina_bmm_aiu_load_mask_zero_post_warmup_recompile():
+    print("[12] Testing Jina bmm zero post-warmup recompile across %16 alignments...")
+    from triton.runtime.shape_bucketing import GLOBAL_BUCKET_TELEMETRY
+
+    with tempfile.TemporaryDirectory(prefix="fg_jina_bmm_") as tdir:
+        old_cache = os.environ.get("TRITON_CACHE_DIR")
+        old_fg_cache = os.environ.get("FLAGGEMS_CACHE_DIR")
+        old_bkt = triton.knobs.autotuning.shape_bucketing
+        old_mode = triton.knobs.autotuning.shape_bucketing_mode
+        try:
+            os.environ["TRITON_CACHE_DIR"] = os.path.join(tdir, "triton")
+            os.environ["FLAGGEMS_CACHE_DIR"] = os.path.join(tdir, "flaggems")
+            triton.knobs.autotuning.shape_bucketing = True
+            triton.knobs.autotuning.shape_bucketing_mode = "inference"
+            GLOBAL_BUCKET_TELEMETRY.reset()
+
+            def _run_pair(batch, seq_len):
+                torch.manual_seed(100 + batch * 13 + seq_len)
+                q = torch.randn(batch, seq_len, 64, device="cuda", dtype=torch.bfloat16) * 0.1
+                kt = torch.randn(batch, 64, seq_len, device="cuda", dtype=torch.bfloat16) * 0.1
+                attn = torch.randn(batch, seq_len, seq_len, device="cuda", dtype=torch.bfloat16) * 0.1
+                v = torch.randn(batch, seq_len, 64, device="cuda", dtype=torch.bfloat16) * 0.1
+                ref_qk = torch.bmm(q, kt)
+                ref_av = torch.bmm(attn, v)
+                with flag_gems.use_gems():
+                    out_qk = torch.bmm(q, kt)
+                    out_av = torch.bmm(attn, v)
+                    torch.cuda.synchronize()
+                assert cos_sim(out_qk, ref_qk) >= 0.9999
+                assert cos_sim(out_av, ref_av) >= 0.9999
+
+            # Warm up 2 non-16-aligned lengths in bucket (128, 256] so M/N/K are observed dynamic
+            _run_pair(12, 188)
+            _run_pair(12, 252)
+            hg_warm = _hgbin_count(os.path.join(tdir, "triton"))
+            cold_warm = GLOBAL_BUCKET_TELEMETRY.summary()["counts"]["COLD_TUNED"]
+
+            # Query 16-aligned length in the same warmed bucket -> 0 cold tunes, 0 new hgbin
+            _run_pair(12, 256)
+            hg_after = _hgbin_count(os.path.join(tdir, "triton"))
+            cold_after = GLOBAL_BUCKET_TELEMETRY.summary()["counts"]["COLD_TUNED"]
+            assert hg_after == hg_warm, f"Unexpected new hgbin: {hg_warm} -> {hg_after}"
+            assert cold_after == cold_warm, f"Unexpected COLD_TUNED: {cold_warm} -> {cold_after}"
+
+            # Reverse: 16-aligned warmup -> non-16-aligned query (B=16) stays PPU-safe & zero-recompile
+            _run_pair(16, 192)
+            _run_pair(16, 256)
+            hg_rev_warm = _hgbin_count(os.path.join(tdir, "triton"))
+            cold_rev_warm = GLOBAL_BUCKET_TELEMETRY.summary()["counts"]["COLD_TUNED"]
+            _run_pair(16, 252)
+            assert _hgbin_count(os.path.join(tdir, "triton")) == hg_rev_warm
+            assert GLOBAL_BUCKET_TELEMETRY.summary()["counts"]["COLD_TUNED"] == cold_rev_warm
+        finally:
+            triton.knobs.autotuning.shape_bucketing = old_bkt
+            triton.knobs.autotuning.shape_bucketing_mode = old_mode
+            if old_cache is not None:
+                os.environ["TRITON_CACHE_DIR"] = old_cache
+            else:
+                os.environ.pop("TRITON_CACHE_DIR", None)
+            if old_fg_cache is not None:
+                os.environ["FLAGGEMS_CACHE_DIR"] = old_fg_cache
+            else:
+                os.environ.pop("FLAGGEMS_CACHE_DIR", None)
+    print("  Jina bmm zero post-warmup recompile OK")
+
 if __name__ == "__main__":
     torch.cuda.set_device(0)
     test_layernorm_3d_4d_no_oob()
@@ -479,4 +545,5 @@ if __name__ == "__main__":
     test_linear_backward_noncontiguous()
     test_select_backward_and_pad_zero_recompile()
     test_bmm_split_k_warm_cache_uses_launch_meta()
+    test_jina_bmm_aiu_load_mask_zero_post_warmup_recompile()
     print("ALL TRAINING OP UNIT TESTS PASSED!")

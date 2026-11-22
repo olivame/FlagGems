@@ -114,6 +114,14 @@ def _tf32_hi(x):
     return (x.to(tl.int32, bitcast=True) & -8192).to(tl.float32, bitcast=True)
 
 
+@triton.heuristics(
+    values={
+        "EVEN_M": lambda args: int(args["B"]) % int(args["BM"]) == 0,
+        "EVEN_KI": lambda args: int(args["K"]) % int(args["BK"]) == 0,
+        "EVEN_KR": lambda args: int(args["H"]) % int(args["BK"]) == 0,
+        "EVEN_H": lambda args: int(args["H"]) % int(args["BH"]) == 0,
+    }
+)
 @triton.jit
 def _plstm_kernel(
     x_ptr,
@@ -500,10 +508,6 @@ def _run_direction(
         HAS_BIAS=has_bias,
         REVERSE=reverse,
         SPLIT2=split2,
-        EVEN_M=(batch % bm) == 0,
-        EVEN_KI=(kdim % bk) == 0,
-        EVEN_KR=(hidden % bk) == 0,
-        EVEN_H=(hidden % bh) == 0,
         BM=bm,
         BH=bh,
         BK=bk,
