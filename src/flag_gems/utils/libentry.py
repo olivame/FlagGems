@@ -191,6 +191,20 @@ def _is_xpu_static_grid_backend() -> bool:
     return res
 
 
+def _supports_cudagraph_bench(vendor_name: Optional[str] = None) -> bool:
+    """Query BackendBucketingCapabilities for CUDA-graph benchmark support."""
+    try:
+        from triton.runtime.backend_caps import get_backend_capabilities
+
+        if vendor_name:
+            caps = get_backend_capabilities(backend=vendor_name)
+        else:
+            caps = get_backend_capabilities()
+        return bool(getattr(caps, "supports_cudagraph_bench", True))
+    except Exception:
+        return True
+
+
 def _canonicalize_static_grid(grid: Any) -> Tuple[Any, ...]:
     try:
         return tuple(int(x) for x in grid)
@@ -199,48 +213,73 @@ def _canonicalize_static_grid(grid: Any) -> Tuple[Any, ...]:
 
 from types import SimpleNamespace
 
-from flag_gems import runtime
+from flag_gems import runtime as _raw_runtime
 from flag_gems.runtime import torch_device_fn
 
-device = getattr(runtime, "device", None)
-if not hasattr(runtime, "TuningMode"):
 
-    class _CompatTuningMode(str, Enum):
-        DEFAULT = "default"
-        EXPANDED = "expanded"
-        COST_MODEL = "cost_model"
+class _CompatTuningMode(str, Enum):
+    DEFAULT = "default"
+    EXPANDED = "expanded"
+    COST_MODEL = "cost_model"
 
-    runtime.TuningMode = _CompatTuningMode
-if not hasattr(runtime, "CostModelIntent"):
 
-    class _CompatCostModelIntent(str, Enum):
-        AUTO = "auto"
-        REQUIRED = "required"
-        DISABLED = "disabled"
+class _CompatCostModelIntent(str, Enum):
+    AUTO = "auto"
+    REQUIRED = "required"
+    DISABLED = "disabled"
 
-    runtime.CostModelIntent = _CompatCostModelIntent
-if not hasattr(runtime, "resolve_cost_model_intent"):
-    runtime.resolve_cost_model_intent = (
-        lambda **kw: runtime.CostModelIntent.DISABLED
-    )
-if not hasattr(runtime, "resolve_tuning_mode"):
-    runtime.resolve_tuning_mode = (
-        lambda *a, **kw: runtime.TuningMode.DEFAULT
-    )
+
+class _ModuleCompatProxy:
+    """Read-through shim providing fallback attrs without mutating modules."""
+
+    __slots__ = ("_target", "_defaults")
+
+    def __init__(self, target: Any, defaults: Dict[str, Any]) -> None:
+        self._target = target
+        self._defaults = defaults
+
+    def __getattr__(self, name: str) -> Any:
+        target = self._target
+        if hasattr(target, name):
+            return getattr(target, name)
+        if name in self._defaults:
+            return self._defaults[name]
+        raise AttributeError(name)
+
+
+runtime = _ModuleCompatProxy(
+    _raw_runtime,
+    {
+        "TuningMode": _CompatTuningMode,
+        "CostModelIntent": _CompatCostModelIntent,
+        "resolve_cost_model_intent": (
+            lambda **kw: getattr(
+                _raw_runtime, "CostModelIntent", _CompatCostModelIntent
+            ).DISABLED
+        ),
+        "resolve_tuning_mode": (
+            lambda *a, **kw: getattr(
+                _raw_runtime, "TuningMode", _CompatTuningMode
+            ).DEFAULT
+        ),
+    },
+)
+device = getattr(_raw_runtime, "device", None)
 
 try:
-    from flag_gems.flagtune.inference import cost_model
+    from flag_gems.flagtune.inference import cost_model as _raw_cost_model
 except ImportError:
-    cost_model = SimpleNamespace()
+    _raw_cost_model = SimpleNamespace()
 
-for _cm_attr, _cm_default in (
-    ("_COST_MODEL_DISABLED_OPS", set()),
-    ("failure_key", lambda *a, **kw: ()),
-    ("auto_failure_state", lambda *a, **kw: (False, False)),
-    ("is_auto_disabled", lambda *a, **kw: False),
-):
-    if not hasattr(cost_model, _cm_attr):
-        setattr(cost_model, _cm_attr, _cm_default)
+cost_model = _ModuleCompatProxy(
+    _raw_cost_model,
+    {
+        "_COST_MODEL_DISABLED_OPS": set(),
+        "failure_key": lambda *a, **kw: (),
+        "auto_failure_state": lambda *a, **kw: (False, False),
+        "is_auto_disabled": lambda *a, **kw: False,
+    },
+)
 
 try:
     from flag_gems.runtime.backend import _state
@@ -592,7 +631,8 @@ class LibTuner(triton.runtime.Autotuner):
                 def do_bench(kernel_call, quantiles):
                     from flag_gems.runtime import device
 
-                    if device.vendor_name == "thead":
+                    vname = getattr(device, "vendor_name", None)
+                    if not _supports_cudagraph_bench(vname):
                         return triton.testing.do_bench(
                             kernel_call,
                             warmup=warmup if warmup is not None else 25,
@@ -2091,6 +2131,7 @@ class LibEntry(triton.KernelInterface):
         params = getattr(self.jit_function, "params", None)
         self._bkt_l0_cache = {}
         self._bkt_l0_bucket_cache = {}
+        self._bkt_l0_lock = threading.Lock()
         self._bkt_l0_tensor_type = tensor_type
         self._bkt_l0_scalar_types = (int, bool, float, str, type(None))
         if params is None:
@@ -2149,6 +2190,15 @@ class LibEntry(triton.KernelInterface):
             parts.append(("xpu_grid", _canonicalize_static_grid(raw_grid)))
         return tuple(parts)
 
+    def _get_bkt_l0_lock(self):
+        lock = getattr(self, "_bkt_l0_lock", None)
+        if lock is None:
+            lock = getattr(self, "lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._bkt_l0_lock = lock
+        return lock
+
     def _build_bkt_l0_bucket_key(self, device, args, kwargs):
         policy, autotune_keys, heuristics_nodes = self._get_bucketing_meta()
         if heuristics_nodes or policy is None:
@@ -2165,9 +2215,26 @@ class LibEntry(triton.KernelInterface):
             count,
         ]
         pnames = self._bkt_l0_param_names
+        all_named = dict(zip(pnames, args))
+        if len(kwargs) > 1:
+            for k, v in kwargs.items():
+                if k != "grid":
+                    all_named[k] = v
+        if hasattr(policy, "observe_args"):
+            policy.observe_args(all_named)
         spec_idx = self.specialize_indices
         dns_idx = self.do_not_specialize_indices
         norm_fn = policy.normalize_entry_scalar
+
+        def _norm_scalar(name: str, val: int):
+            is_tuned = name in autotune_keys
+            try:
+                return norm_fn(
+                    name, val, is_autotuned_key=is_tuned, all_args=all_named
+                )
+            except TypeError:
+                return norm_fn(name, val, is_autotuned_key=is_tuned)
+
         for idx, arg in enumerate(args):
             t = type(arg)
             if t is int:
@@ -2179,8 +2246,7 @@ class LibEntry(triton.KernelInterface):
                     else:
                         parts.append("i64")
                 elif idx in spec_idx:
-                    pname = pnames[idx]
-                    parts.append(norm_fn(pname, arg, is_autotuned_key=(pname in autotune_keys)))
+                    parts.append(_norm_scalar(pnames[idx], arg))
                 else:
                     parts.append((int, arg))
             elif t in scalar_types:
@@ -2205,7 +2271,7 @@ class LibEntry(triton.KernelInterface):
                         else:
                             parts.append((k, "i64"))
                     elif k in spec_names_set:
-                        parts.append((k, norm_fn(k, v, is_autotuned_key=(k in autotune_keys))))
+                        parts.append((k, _norm_scalar(k, v)))
                     else:
                         parts.append((k, int, v))
                 elif t in scalar_types:
@@ -2218,6 +2284,16 @@ class LibEntry(triton.KernelInterface):
         if raw_grid is not None and not callable(raw_grid) and _is_xpu_static_grid_backend():
             parts.append(("xpu_grid", _canonicalize_static_grid(raw_grid)))
         return tuple(parts)
+
+    def _promote_bkt_l0_hit(self, l0_key, saved):
+        l0_limit = getattr(triton.knobs.autotuning, "max_bucket_artifacts", None)
+        cap = int(l0_limit) if (l0_limit is not None and int(l0_limit) > 0) else 4096
+        with self._get_bkt_l0_lock():
+            l0_cache = self._bkt_l0_cache
+            l0_cache.pop(l0_key, None)
+            l0_cache[l0_key] = saved
+            while len(l0_cache) > cap:
+                l0_cache.pop(next(iter(l0_cache)), None)
 
     def _store_bkt_l0_entry(self, l0_key, entry_key, entry, count, kwargs, bkt_l0_key=None):
         if l0_key is None or not getattr(self, "_bkt_l0_supported", False):
@@ -2237,21 +2313,22 @@ class LibEntry(triton.KernelInterface):
             if default is inspect._empty and name not in kwargs:
                 return
             defaults.append((name, default))
-        l0_cache = self._bkt_l0_cache
         l0_limit = getattr(triton.knobs.autotuning, "max_bucket_artifacts", None)
         cap = int(l0_limit) if (l0_limit is not None and int(l0_limit) > 0) else 4096
         has_tuner = getattr(self, "_ft_autotuner_node", None) is not None
-        l0_cache.pop(l0_key, None)
         val_tuple = (entry_key, entry, tuple(defaults), has_tuner)
-        l0_cache[l0_key] = val_tuple
-        while len(l0_cache) > cap:
-            l0_cache.pop(next(iter(l0_cache)), None)
-        if bkt_l0_key is not None:
-            bkt_cache = self._bkt_l0_bucket_cache
-            bkt_cache.pop(bkt_l0_key, None)
-            bkt_cache[bkt_l0_key] = val_tuple
-            while len(bkt_cache) > cap:
-                bkt_cache.pop(next(iter(bkt_cache)), None)
+        with self._get_bkt_l0_lock():
+            l0_cache = self._bkt_l0_cache
+            l0_cache.pop(l0_key, None)
+            l0_cache[l0_key] = val_tuple
+            while len(l0_cache) > cap:
+                l0_cache.pop(next(iter(l0_cache)), None)
+            if bkt_l0_key is not None:
+                bkt_cache = self._bkt_l0_bucket_cache
+                bkt_cache.pop(bkt_l0_key, None)
+                bkt_cache[bkt_l0_key] = val_tuple
+                while len(bkt_cache) > cap:
+                    bkt_cache.pop(next(iter(bkt_cache)), None)
 
     def _resolve_dispatch_guard(self):
         guard = getattr(self, "dispatch_guard", None)
@@ -2296,7 +2373,7 @@ class LibEntry(triton.KernelInterface):
                     if bkt_l0_key is not None:
                         saved = self._bkt_l0_bucket_cache.get(bkt_l0_key)
                         if saved is not None:
-                            self._bkt_l0_cache[l0_key] = saved
+                            self._promote_bkt_l0_hit(l0_key, saved)
                 if saved is not None:
                     l0_ekey, entry, plan_defaults, has_tuner = saved
                     cache = self._cpu_cache if device == "cpu" else self.kernel_cache[device]

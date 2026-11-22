@@ -756,5 +756,136 @@ class TestLibEntryFlagTreeBucketing(unittest.TestCase):
         self.assertNotIn("best_config", splitk_src)
 
 
+    def test_l0_bucket_key_observes_args_and_forwards_all_args(self):
+        """Tier-0.5 _build_bkt_l0_bucket_key calls observe_args() and passes all_args."""
+        src = """
+        def grp_kern(x_ptr, B, M, BLOCK_SIZE: tl.constexpr):
+            pass
+        """
+        jit_fn = _FakeJIT(src)
+        for p in jit_fn.params:
+            if p.name == "B":
+                p.do_not_specialize = True
+
+        observed = []
+        seen_all_args = []
+
+        class _GroupPolicy:
+            def observe_args(self, named):
+                observed.append(dict(named))
+
+            def normalize_entry_scalar(self, name, val, *, is_autotuned_key=False, all_args=None):
+                seen_all_args.append((name, int(val), all_args))
+                grp = all_args.get("B") if isinstance(all_args, dict) else None
+                if name == "M":
+                    return ("ft_bkt", grp, 1, 256)
+                return ("ft_exact", int(val))
+
+        policy = _GroupPolicy()
+        entry = _build_synthetic_libentry(jit_fn, jit_fn, cache_binding=False)
+        entry.specialize_indices = [
+            i for i, p in enumerate(jit_fn.params)
+            if not p.is_constexpr and not p.do_not_specialize
+        ]
+        entry.do_not_specialize_indices = [
+            i for i, p in enumerate(jit_fn.params) if p.do_not_specialize
+        ]
+        entry.shape_policy = policy
+        entry._get_bucketing_meta = lambda: (policy, frozenset(), ())
+        x = _make_tensor()
+
+        with triton.knobs.autotuning.scope():
+            triton.knobs.autotuning.shape_bucketing = True
+            triton.knobs.autotuning.shape_bucketing_mode = "inference"
+            triton.knobs.autotuning.distributed_dispatch_guard = False
+
+            entry.run(x, 4, 128, BLOCK_SIZE=64, grid=(1,))
+            obs_1 = len(observed)
+            norm_1 = len(seen_all_args)
+
+            # Same group B=4, unseen M=192 hits Tier-0.5 bucket cache
+            entry.run(x, 4, 192, BLOCK_SIZE=64, grid=(1,))
+            self.assertGreater(len(observed), obs_1)
+            m192 = [r for r in seen_all_args[norm_1:] if r[0] == "M" and r[1] == 192]
+            self.assertTrue(m192 and all(isinstance(r[2], dict) and r[2].get("B") == 4 for r in m192))
+
+            # Distinct group B=8 must NOT collide with B=4 in Tier-0.5 L0 bucket cache
+            c_before = len(jit_fn.compiled_kernels)
+            entry.run(x, 8, 192, BLOCK_SIZE=64, grid=(1,))
+            self.assertEqual(len(jit_fn.compiled_kernels), c_before + 1)
+
+    def test_l0_concurrent_insert_and_promotion_threadsafe(self):
+        """Concurrent L0 writes/promotions enforce cap without dict mutation races."""
+        src = """
+        def l0_race_kern(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+            pass
+        """
+        jit_fn = _FakeJIT(src)
+        entry = _build_synthetic_libentry(jit_fn, jit_fn, cache_binding=False)
+        x = _make_tensor()
+
+        old_iv = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            with triton.knobs.autotuning.scope():
+                triton.knobs.autotuning.shape_bucketing = True
+                triton.knobs.autotuning.shape_bucketing_mode = "inference"
+                triton.knobs.autotuning.distributed_dispatch_guard = False
+                triton.knobs.autotuning.max_bucket_artifacts = 4
+
+                entry.run(x, 64, BLOCK_SIZE=64, grid=(1,))
+                dummy = entry.kernel_cache[0][next(iter(entry.kernel_cache[0]))]
+                errs = []
+                barrier = threading.Barrier(8)
+
+                def worker(tid):
+                    barrier.wait()
+                    for i in range(150):
+                        k = ("k", tid, i)
+                        bk = ("bk", (tid * 17 + i) % 10)
+                        try:
+                            entry._store_bkt_l0_entry(
+                                k, ("ek", i), dummy, 2, {"grid": (1,)}, bkt_l0_key=bk
+                            )
+                            entry._promote_bkt_l0_hit(("p", tid, i), ("ek", dummy, (), False))
+                            _ = entry._bkt_l0_cache.get(k)
+                            with entry._get_bkt_l0_lock():
+                                if len(entry._bkt_l0_cache) > 4:
+                                    errs.append("l0_cap_exceeded")
+                        except Exception as exc:
+                            errs.append(f"{type(exc).__name__}: {exc}")
+
+                threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                self.assertEqual(errs, [])
+                self.assertLessEqual(len(entry._bkt_l0_cache), 4)
+                self.assertLessEqual(len(entry._bkt_l0_bucket_cache), 4)
+        finally:
+            sys.setswitchinterval(old_iv)
+
+    def test_dehardcode_supports_cudagraph_bench_and_fused_compliance(self):
+        """Verify backend_caps supports_cudagraph_bench & fused/ zero bucketing branches."""
+        fg_root = Path(__file__).resolve().parents[1]
+        lib_src = (fg_root / "src/flag_gems/utils/libentry.py").read_text(encoding="utf-8")
+        self.assertNotIn('vendor_name == "thead"', lib_src)
+        self.assertFalse(lib._supports_cudagraph_bench("thead"))
+        self.assertFalse(lib._supports_cudagraph_bench("ppu"))
+        self.assertTrue(lib._supports_cudagraph_bench("nvidia"))
+
+        tools_dir = str(fg_root / "tools")
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import check_bucketing_compliance as scanner
+
+        rep = scanner.scan_flaggems(fg_root)
+        self.assertIn("fused", rep["by_scope"])
+        self.assertGreater(rep["by_scope"]["fused"]["files_scanned"], 0)
+        for scope in ("generic_ops", "fused", "backend:_thead"):
+            cnt = rep["by_scope"][scope]["rule_file_counts"].get("op_level_bucketing_branch", 0)
+            self.assertEqual(cnt, 0, f"Unexpected op_level_bucketing_branch in {scope}")
+
 if __name__ == "__main__":
     unittest.main()

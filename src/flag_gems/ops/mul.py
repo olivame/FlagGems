@@ -584,11 +584,6 @@ def mul_complex_generic_4d_scalar_kernel(
     tl.store(out_i_ptr + oi_off, out_i, mask=mask)
 
 
-def _is_shape_bucketing_enabled() -> bool:
-    autotuning = getattr(getattr(triton, "knobs", None), "autotuning", None)
-    return bool(autotuning is not None and getattr(autotuning, "shape_bucketing", False))
-
-
 def _pad4(vals, pad_val):
     if len(vals) < 4:
         return (pad_val,) * (4 - len(vals)) + tuple(vals)
@@ -790,7 +785,7 @@ def _launch_generic(a_t, b_t, output, out_shape, a_stride, b_stride, out_stride,
     b_stride = b_stride or (0,)
     out_stride = out_stride or (0,)
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    if _is_shape_bucketing_enabled() and ndim <= 4:
+    if ndim <= 4:
         s0, s1, s2, s3 = _pad4(shape, 1)
         a_s0, a_s1, a_s2, a_s3 = _pad4(a_stride, 0)
         b_s0, b_s1, b_s2, b_s3 = _pad4(b_stride, 0)
@@ -811,35 +806,18 @@ def _launch_generic(a_t, b_t, output, out_shape, a_stride, b_stride, out_stride,
                 USE_INT64=use_int64,
             )
         return output
-    if _needs_runtime_meta_for_constexpr_tuple() or _is_shape_bucketing_enabled():
-        meta = torch.tensor(
-            shape + a_stride + b_stride + out_stride,
-            device=output.device,
-            dtype=torch.int64,
-        )
-        with torch_device_fn.device(output.device):
-            mul_generic_nd_runtime_meta_kernel[grid](
-                a_t,
-                b_t,
-                output,
-                meta,
-                n_elements,
-                NDIM=ndim,
-                dtype=_dtype_name(dtype),
-                IS_BOOL=_is_bool_dtype(dtype),
-            )
-        return output
-
+    meta = torch.tensor(
+        shape + a_stride + b_stride + out_stride,
+        device=output.device,
+        dtype=torch.int64,
+    )
     with torch_device_fn.device(output.device):
-        mul_generic_nd_kernel[grid](
+        mul_generic_nd_runtime_meta_kernel[grid](
             a_t,
             b_t,
             output,
+            meta,
             n_elements,
-            SHAPE=shape,
-            A_STRIDE=a_stride,
-            B_STRIDE=b_stride,
-            OUT_STRIDE=out_stride,
             NDIM=ndim,
             dtype=_dtype_name(dtype),
             IS_BOOL=_is_bool_dtype(dtype),
@@ -955,7 +933,7 @@ def _launch_complex_generic(
     out_r_stride = out_r_stride or (0,)
     out_i_stride = out_i_stride or (0,)
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    if _is_shape_bucketing_enabled() and ndim <= 4 and kernels is None:
+    if ndim <= 4 and kernels is None:
         s0, s1, s2, s3 = _pad4(shape, 1)
         ar_s0, ar_s1, ar_s2, ar_s3 = _pad4(strides[0], 0)
         ai_s0, ai_s1, ai_s2, ai_s3 = _pad4(strides[1], 0)
@@ -988,7 +966,7 @@ def _launch_complex_generic(
                 USE_INT64=use_int64,
             )
         return output
-    if _needs_runtime_meta_for_constexpr_tuple() or _is_shape_bucketing_enabled():
+    if _needs_runtime_meta_for_constexpr_tuple() or kernels is None:
         meta = torch.tensor(
             shape
             + strides[0]

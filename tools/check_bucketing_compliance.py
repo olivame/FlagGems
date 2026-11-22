@@ -58,6 +58,9 @@ def scan_flaggems(root: Path) -> Dict[str, Any]:
     scopes: List[tuple[str, List[Path]]] = [
         ("generic_ops", sorted((src / "ops").glob("*.py"))),
     ]
+    fused_root = src / "fused"
+    if fused_root.is_dir():
+        scopes.append(("fused", sorted(fused_root.rglob("*.py"))))
     bk_root = src / "runtime/backend"
     if bk_root.is_dir():
         for bk in sorted(bk_root.iterdir()):
