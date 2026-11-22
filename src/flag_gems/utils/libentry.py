@@ -113,6 +113,54 @@ def _is_shape_bucketing_active(obj: Any = None) -> bool:
         return False
 
 
+def _is_distributed_dispatch_guard_enabled() -> bool:
+    """Return True when FlagTree distributed dispatch guard is enabled."""
+    try:
+        return bool(triton.knobs.autotuning.distributed_dispatch_guard)
+    except AttributeError:
+        return False
+
+
+@contextmanager
+def _coordinate_dispatch_guard(guard: Any, is_cold_miss: bool):
+    """Coordinate one dispatch step with ``guard`` (re-entrant, safe on custom guards)."""
+    if guard is None:
+        yield None
+        return
+    try:
+        from triton.runtime import _distributed as _dist_mod
+    except Exception:
+        yield None
+        return
+
+    in_scope_fn = getattr(_dist_mod, "is_in_dispatch_guard_scope", None)
+    if callable(in_scope_fn) and in_scope_fn():
+        yield None
+        return
+
+    local_state = (
+        _dist_mod.RankDispatchState.ANY_COLD_COMPILE
+        if is_cold_miss
+        else _dist_mod.RankDispatchState.ALL_HOT_HIT
+    )
+    coord = getattr(guard, "coordinate", None)
+    if callable(coord):
+        with coord(local_state) as decision:
+            yield decision
+        return
+
+    scope_fn = getattr(_dist_mod, "dispatch_guard_scope", None)
+    decision = guard.negotiate(local_state)
+    try:
+        if callable(scope_fn):
+            with scope_fn():
+                yield decision
+        else:
+            yield decision
+    finally:
+        guard.post_compile_sync(decision)
+
+
 _STATIC_GRID_CACHE: Dict[Tuple[str, str, str, Optional[str]], bool] = {}
 
 
@@ -1212,104 +1260,101 @@ class LibTuner(triton.runtime.Autotuner):
                         f"{config_key[0]}::guard:{json.dumps(exact_guard, separators=(',', ':'))}",
                     )
             _lt_guard = None
-            _lt_decision = None
-            if getattr(triton.knobs.autotuning, "distributed_dispatch_guard", False):
+            if _is_distributed_dispatch_guard_enabled():
                 try:
-                    from triton.runtime._distributed import RankDispatchState, get_default_dispatch_guard
-                    _lt_guard = getattr(self, "dispatch_guard", None) or get_default_dispatch_guard()
-                    if _lt_guard is not None:
-                        _lt_local = (
-                            RankDispatchState.ANY_COLD_COMPILE
-                            if (bypass_config_cache or config_key not in config_cache_store)
-                            else RankDispatchState.ALL_HOT_HIT
+                    from triton.runtime import _distributed as _dist_mod
+
+                    _in_scope = getattr(_dist_mod, "is_in_dispatch_guard_scope", None)
+                    if not (callable(_in_scope) and _in_scope()):
+                        _lt_guard = (
+                            getattr(self, "dispatch_guard", None)
+                            or _dist_mod.get_default_dispatch_guard()
                         )
-                        _lt_decision = _lt_guard.negotiate(_lt_local)
                 except Exception:
                     _lt_guard = None
-                    _lt_decision = None
 
-            if bypass_config_cache or config_key not in config_cache_store:
-                cache: BenchmarkCache = libcache[
-                    self.benchmark_table_name, benchmark_key
-                ]
-                # prune configs
-                used_cached_result = False
-                pruned_configs = (
-                    self.configs
-                    if cost_model_mode and not exhaustive_collection
-                    else self.prune_configs(kwargs)
-                )
-                bench_start = time.time()
-
-                def bench(config: triton.Config) -> List[float]:
-                    ret = cache.get(config)
-                    if ret is None:
-                        try:
-                            ret = self._bench(*args, config=config, **kwargs)
-                        except (RuntimeError, _TritonOutOfResources) as e:
-                            if getattr(self, "_flagtune_strict_benchmark", False):
-                                raise
-                            # A config whose COMPILE raises a plain RuntimeError
-                            # is outside triton's autotuner catch list
-                            # (OutOfResources / CompileTimeAssertionFailure /
-                            # PTXASError) and would kill the whole process. Some
-                            # backend compilers do this — e.g. cambricon MLU
-                            # AutoTileForTritonPass raises "PassManager::run
-                            # failed" on a tensor.expand_shape it cannot tile.
-                            # Treat such a config as a non-candidate (inf) so
-                            # tuning continues and a working config is selected.
-                            print(f"[libentry] config {config} failed to compile: {e}")
-                            ret = (float("inf"), float("inf"), float("inf"))
-                        # Some Triton backends (e.g. tsingmicro with
-                        # use_cuda_graph=True) return a scalar float from
-                        # _bench instead of the standard (p50, p20, p80) tuple.
-                        # Normalize to a 3-element tuple for compatibility with
-                        # SQLPersistantModel.put_benchmark and other consumers.
-                        if isinstance(ret, (int, float)):
-                            ret = (ret, ret, ret)
-                        if ret and all(math.isfinite(float(value)) for value in ret):
-                            self.benchmark_success_count += 1
-                        cache[config] = tuple(ret)
-                    else:
-                        self.benchmark_cache_hit_count += 1
-                    return list(ret)
-
-                if exhaustive_collection:
-                    best_config, timings = LibTuner.get("default").policy(
-                        self,
-                        bench,
-                        pruned_configs,
-                        args,
-                        kwargs,
+            _lt_is_miss = bypass_config_cache or config_key not in config_cache_store
+            with _coordinate_dispatch_guard(_lt_guard, is_cold_miss=_lt_is_miss):
+                if bypass_config_cache or config_key not in config_cache_store:
+                    cache: BenchmarkCache = libcache[
+                        self.benchmark_table_name, benchmark_key
+                    ]
+                    # prune configs
+                    used_cached_result = False
+                    pruned_configs = (
+                        self.configs
+                        if cost_model_mode and not exhaustive_collection
+                        else self.prune_configs(kwargs)
                     )
+                    bench_start = time.time()
+
+                    def bench(config: triton.Config) -> List[float]:
+                        ret = cache.get(config)
+                        if ret is None:
+                            try:
+                                ret = self._bench(*args, config=config, **kwargs)
+                            except (RuntimeError, _TritonOutOfResources) as e:
+                                if getattr(self, "_flagtune_strict_benchmark", False):
+                                    raise
+                                # A config whose COMPILE raises a plain RuntimeError
+                                # is outside triton's autotuner catch list
+                                # (OutOfResources / CompileTimeAssertionFailure /
+                                # PTXASError) and would kill the whole process. Some
+                                # backend compilers do this — e.g. cambricon MLU
+                                # AutoTileForTritonPass raises "PassManager::run
+                                # failed" on a tensor.expand_shape it cannot tile.
+                                # Treat such a config as a non-candidate (inf) so
+                                # tuning continues and a working config is selected.
+                                print(f"[libentry] config {config} failed to compile: {e}")
+                                ret = (float("inf"), float("inf"), float("inf"))
+                            # Some Triton backends (e.g. tsingmicro with
+                            # use_cuda_graph=True) return a scalar float from
+                            # _bench instead of the standard (p50, p20, p80) tuple.
+                            # Normalize to a 3-element tuple for compatibility with
+                            # SQLPersistantModel.put_benchmark and other consumers.
+                            if isinstance(ret, (int, float)):
+                                ret = (ret, ret, ret)
+                            if ret and all(math.isfinite(float(value)) for value in ret):
+                                self.benchmark_success_count += 1
+                            cache[config] = tuple(ret)
+                        else:
+                            self.benchmark_cache_hit_count += 1
+                        return list(ret)
+
+                    if exhaustive_collection:
+                        best_config, timings = LibTuner.get("default").policy(
+                            self,
+                            bench,
+                            pruned_configs,
+                            args,
+                            kwargs,
+                        )
+                    else:
+                        best_config, timings = self.policy(
+                            bench,
+                            pruned_configs,
+                            args,
+                            kwargs,
+                        )
+                    bench_end = time.time()
+                    self.bench_time = bench_end - bench_start
+                    config = best_config
+                    if not bypass_config_cache:
+                        if self._flagtune_fallback_cache is None:
+                            config_cache_store[config_key] = best_config
+                            config = config_cache_store[config_key]
+                        else:
+                            fallback_cache, fallback_key = self._flagtune_fallback_cache
+                            fallback_cache[fallback_key] = best_config
+                    full_nargs = {
+                        **self.nargs,
+                        **kwargs,
+                        **config.all_kwargs(),
+                    }
+                    self.pre_hook(full_nargs, reset_only=True)
+                    self.configs_timings = timings
                 else:
-                    best_config, timings = self.policy(
-                        bench,
-                        pruned_configs,
-                        args,
-                        kwargs,
-                    )
-                bench_end = time.time()
-                self.bench_time = bench_end - bench_start
-                config = best_config
-                if not bypass_config_cache:
-                    if self._flagtune_fallback_cache is None:
-                        config_cache_store[config_key] = best_config
-                        config = config_cache_store[config_key]
-                    else:
-                        fallback_cache, fallback_key = self._flagtune_fallback_cache
-                        fallback_cache[fallback_key] = best_config
-                full_nargs = {
-                    **self.nargs,
-                    **kwargs,
-                    **config.all_kwargs(),
-                }
-                self.pre_hook(full_nargs, reset_only=True)
-                self.configs_timings = timings
-            else:
-                config = config_cache_store[config_key]
-            if _lt_guard is not None and _lt_decision is not None:
-                _lt_guard.post_compile_sync(_lt_decision)
+                    config = config_cache_store[config_key]
             if bucketing_active:
                 lookup = getattr(self, "_last_bucket_lookup", None)
                 if lookup is not None:
@@ -2208,10 +2253,28 @@ class LibEntry(triton.KernelInterface):
             while len(bkt_cache) > cap:
                 bkt_cache.pop(next(iter(bkt_cache)), None)
 
+    def _resolve_dispatch_guard(self):
+        guard = getattr(self, "dispatch_guard", None)
+        if guard is not None:
+            return guard
+        fn = self.fn
+        while fn is not None and not isinstance(fn, triton.runtime.JITFunction):
+            guard = getattr(fn, "dispatch_guard", None)
+            if guard is not None:
+                return guard
+            fn = getattr(fn, "fn", None)
+        try:
+            from triton.runtime._distributed import get_default_dispatch_guard
+
+            return get_default_dispatch_guard()
+        except Exception:
+            return None
+
     def run(self, *args, **kwargs):
+        guard_enabled = _is_distributed_dispatch_guard_enabled()
         bucketing_active = _is_shape_bucketing_active(self)
         if not bucketing_active:
-            if self._cache_binding:
+            if self._cache_binding and not guard_enabled:
                 cached = self._run_cached(args, kwargs)
                 if cached is not None:
                     return cached
@@ -2258,7 +2321,14 @@ class LibEntry(triton.KernelInterface):
                                 hook_nargs = {**dict(zip(self.arg_names, args)), **kwargs}
                                 for pre_hook, hook_kwargs in hooks:
                                     pre_hook({**hook_nargs, **hook_kwargs})
-                            kernel[grid[:3]](*all_args)
+                            if guard_enabled:
+                                _entry_guard = self._resolve_dispatch_guard()
+                                with _coordinate_dispatch_guard(
+                                    _entry_guard, is_cold_miss=False
+                                ):
+                                    kernel[grid[:3]](*all_args)
+                            else:
+                                kernel[grid[:3]](*all_args)
                             return kernel, constexprs
         grid = kwargs["grid"]
 
@@ -2346,84 +2416,89 @@ class LibEntry(triton.KernelInterface):
                     entry_key = entry_key + (
                         ("ft_post_heur", tuple(sorted(actual_heur.items()))),
                     )
-        while entry_key not in cache:
-            # NOTE: we serialize the first run of a jit function regardless of which device to run on
-            # because Triton runtime is currently not threadsafe.
-            with self.lock:
-                if entry_key in cache:
-                    break
-                kernel = self._first_run(*args, **kwargs)
-                fn = self.fn
-                # collect constexpr arguments for grid computation
-                constexprs = {}
-                tune_constexprs = {}
-                heur_constexprs = {}
-                launch_pre_hooks = []
-                bkt_policy = self._get_bucketing_meta()[0] if bucketing_active else None
-                while not isinstance(fn, triton.runtime.JITFunction):
-                    if isinstance(fn, triton.runtime.Autotuner):
-                        config = fn.best_config
-                        constexprs["num_warps"] = config.num_warps
-                        constexprs["num_stages"] = config.num_stages
-                        constexprs["num_ctas"] = config.num_ctas
-                        constexprs = {**constexprs, **config.kwargs}
-                        tune_constexprs = {**tune_constexprs, **config.kwargs}
-                        if config.pre_hook is not None:
-                            launch_pre_hooks.append(
-                                (config.pre_hook, config.all_kwargs())
+        _entry_coordinated = False
+        if entry_key not in cache:
+            _entry_guard = self._resolve_dispatch_guard() if guard_enabled else None
+            _entry_coordinated = _entry_guard is not None
+            with _coordinate_dispatch_guard(_entry_guard, is_cold_miss=True):
+                while entry_key not in cache:
+                    # NOTE: we serialize the first run of a jit function regardless of which device to run on
+                    # because Triton runtime is currently not threadsafe.
+                    with self.lock:
+                        if entry_key in cache:
+                            break
+                        kernel = self._first_run(*args, **kwargs)
+                        fn = self.fn
+                        # collect constexpr arguments for grid computation
+                        constexprs = {}
+                        tune_constexprs = {}
+                        heur_constexprs = {}
+                        launch_pre_hooks = []
+                        bkt_policy = self._get_bucketing_meta()[0] if bucketing_active else None
+                        while not isinstance(fn, triton.runtime.JITFunction):
+                            if isinstance(fn, triton.runtime.Autotuner):
+                                config = fn.best_config
+                                constexprs["num_warps"] = config.num_warps
+                                constexprs["num_stages"] = config.num_stages
+                                constexprs["num_ctas"] = config.num_ctas
+                                constexprs = {**constexprs, **config.kwargs}
+                                tune_constexprs = {**tune_constexprs, **config.kwargs}
+                                if config.pre_hook is not None:
+                                    launch_pre_hooks.append(
+                                        (config.pre_hook, config.all_kwargs())
+                                    )
+                            elif isinstance(fn, triton.runtime.Heuristics):
+                                h_env = {
+                                    **dict(zip(fn.arg_names, args)),
+                                    **kwargs,
+                                    **constexprs,
+                                }
+                                if bucketing_active and bkt_policy is not None:
+                                    from triton.runtime.shape_bucketing import evaluate_heuristics_for_bucketing
+                                    evaluated = evaluate_heuristics_for_bucketing(
+                                        fn.values, h_env, bkt_policy
+                                    )
+                                    heur_constexprs.update(evaluated)
+                                    constexprs.update(evaluated)
+                                else:
+                                    for v, heur in fn.values.items():
+                                        val = heur(h_env)
+                                        heur_constexprs[v] = val
+                                        constexprs[v] = val
+                                        h_env[v] = val
+                            else:
+                                raise RuntimeError("Invalid Runtime Function")
+                            fn = fn.fn
+                        for p in self.jit_function.params:
+                            if (
+                                p.is_constexpr
+                                and p.name not in constexprs
+                                and (p.default is not inspect._empty)
+                            ):
+                                constexprs[p.name] = p.default
+                        cache[entry_key] = (
+                            kernel,
+                            constexprs,
+                            tune_constexprs,
+                            heur_constexprs,
+                            tuple(launch_pre_hooks),
+                        )
+                    if bucketing_active:
+                        max_bkt = getattr(triton.knobs.autotuning, "max_bucket_artifacts", None)
+                        if max_bkt is not None and max_bkt > 0:
+                            from triton.runtime.shape_bucketing import BucketCacheBudget
+                            budget = getattr(self, "_ft_entry_cache_budget", None)
+                            if budget is None:
+                                budget = BucketCacheBudget(max_bkt)
+                                self._ft_entry_cache_budget = budget
+                            budget.touch_and_evict(cache, entry_key, max_entries=max_bkt)
+                        if l0_key is not None:
+                            if bkt_l0_key is None:
+                                bkt_l0_key = self._build_bkt_l0_bucket_key(device, args, kwargs)
+                            self._store_bkt_l0_entry(
+                                l0_key, entry_key, cache[entry_key], len(args), kwargs, bkt_l0_key=bkt_l0_key
                             )
-                    elif isinstance(fn, triton.runtime.Heuristics):
-                        h_env = {
-                            **dict(zip(fn.arg_names, args)),
-                            **kwargs,
-                            **constexprs,
-                        }
-                        if bucketing_active and bkt_policy is not None:
-                            from triton.runtime.shape_bucketing import evaluate_heuristics_for_bucketing
-                            evaluated = evaluate_heuristics_for_bucketing(
-                                fn.values, h_env, bkt_policy
-                            )
-                            heur_constexprs.update(evaluated)
-                            constexprs.update(evaluated)
-                        else:
-                            for v, heur in fn.values.items():
-                                val = heur(h_env)
-                                heur_constexprs[v] = val
-                                constexprs[v] = val
-                                h_env[v] = val
-                    else:
-                        raise RuntimeError("Invalid Runtime Function")
-                    fn = fn.fn
-                for p in self.jit_function.params:
-                    if (
-                        p.is_constexpr
-                        and p.name not in constexprs
-                        and (p.default is not inspect._empty)
-                    ):
-                        constexprs[p.name] = p.default
-                cache[entry_key] = (
-                    kernel,
-                    constexprs,
-                    tune_constexprs,
-                    heur_constexprs,
-                    tuple(launch_pre_hooks),
-                )
-            if bucketing_active:
-                max_bkt = getattr(triton.knobs.autotuning, "max_bucket_artifacts", None)
-                if max_bkt is not None and max_bkt > 0:
-                    from triton.runtime.shape_bucketing import BucketCacheBudget
-                    budget = getattr(self, "_ft_entry_cache_budget", None)
-                    if budget is None:
-                        budget = BucketCacheBudget(max_bkt)
-                        self._ft_entry_cache_budget = budget
-                    budget.touch_and_evict(cache, entry_key, max_entries=max_bkt)
-                if l0_key is not None:
-                    if bkt_l0_key is None:
-                        bkt_l0_key = self._build_bkt_l0_bucket_key(device, args, kwargs)
-                    self._store_bkt_l0_entry(
-                        l0_key, entry_key, cache[entry_key], len(args), kwargs, bkt_l0_key=bkt_l0_key
-                    )
-            return kernel, constexprs
+                    return kernel, constexprs
 
         if bucketing_active and all_named_args is not None:
             self._record_autotuner_entry_hit(all_named_args)
@@ -2474,9 +2549,15 @@ class LibEntry(triton.KernelInterface):
                     raise RuntimeError(
                         f"[libentry]: probably a bug, the following kernel params where not captured: {missing_keys}"
                     )
-            kernel[grid[0:3]](*all_args)
+            launch_args = all_args
         else:
-            kernel[grid[0:3]](*k_args.values())
+            launch_args = k_args.values()
+        if guard_enabled and not _entry_coordinated:
+            _l1_guard = self._resolve_dispatch_guard()
+            with _coordinate_dispatch_guard(_l1_guard, is_cold_miss=False):
+                kernel[grid[0:3]](*launch_args)
+        else:
+            kernel[grid[0:3]](*launch_args)
         return kernel, constexprs
 
     def _init_cached_binding(self):

@@ -1721,7 +1721,7 @@ def _run_ppu_bmm_split_k(A, B, out, bias, alpha, beta, fuse_bias):
         batch,
     )
     with torch_device_fn.device(A.device):
-        bmm_split_k_kernel_ppu[grid](
+        _, launch_meta = bmm_split_k_kernel_ppu[grid](
             A,
             B,
             workspace,
@@ -1735,12 +1735,9 @@ def _run_ppu_bmm_split_k(A, B, out, bias, alpha, beta, fuse_bias):
             aiu_load_mask=_aiu_load_mask(A, B),
             EVEN_MN=False,
         )
-        tuner = bmm_split_k_kernel_ppu
-        while not hasattr(tuner, "best_config"):
-            tuner = getattr(tuner, "fn", None)
-            if tuner is None:
-                raise RuntimeError("BMM split-K tuner did not expose best_config")
-        split_k = tuner.best_config.kwargs["SPLIT_K"]
+        # A warm LibEntry launch does not update the tuner's best_config.
+        # Its returned metadata belongs to this exact cached kernel/shape.
+        split_k = launch_meta["SPLIT_K"]
         _run_ppu_bmm_reduce(workspace, out, bias, alpha, beta, split_k, fuse_bias)
     return out
 

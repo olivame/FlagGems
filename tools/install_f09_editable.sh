@@ -16,7 +16,8 @@ while [[ $# -gt 0 ]]; do
     --target)   TARGET_DIR="$2"; shift 2 ;;
     --python)   PYTHON_BIN="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: $0 --flagtree <FlagTree_repo> [--flaggems <FlagGems_repo>] [--target <isolated_dir>] [--python python3]"
+      echo "Usage: $0 --flagtree <FlagTree_repo> [--flaggems <FlagGems_repo>]" \
+        "[--target <isolated_dir>] [--python python3]"
       exit 0
       ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;

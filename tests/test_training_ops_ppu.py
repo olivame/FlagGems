@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import warnings
 from pathlib import Path
@@ -60,8 +61,10 @@ def test_layernorm_3d_4d_no_oob():
                 assert cos_sim(yg, ya) >= cos_thr, f"LN fwd mismatch {dtype} {shape}"
                 assert cos_sim(xg.grad, xa.grad) >= cos_thr, f"LN dx mismatch {dtype} {shape}"
                 if affine:
-                    assert cos_sim(wg.grad, wa.grad) >= cos_thr, f"LN dw mismatch {dtype} {shape}: {cos_sim(wg.grad, wa.grad)}"
-                    assert cos_sim(bg.grad, ba.grad) >= cos_thr, f"LN db mismatch {dtype} {shape}: {cos_sim(bg.grad, ba.grad)}"
+                    c_dw = cos_sim(wg.grad, wa.grad)
+                    c_db = cos_sim(bg.grad, ba.grad)
+                    assert c_dw >= cos_thr, f"LN dw mismatch {dtype} {shape}: {c_dw}"
+                    assert c_db >= cos_thr, f"LN db mismatch {dtype} {shape}: {c_db}"
     print("  LayerNorm OK")
 
 
@@ -124,9 +127,10 @@ def test_nll_loss_and_cross_entropy_ignore_index():
                 with warnings.catch_warnings(record=True) as rec:
                     warnings.simplefilter("always")
                     with flag_gems.use_gems():
-                        can_pre = torch.full((2048,), 0x76543210FEDCBA98 & ((1 << 63) - 1), dtype=torch.int64, device="cuda")
+                        canary_val = 0x76543210FEDCBA98 & ((1 << 63) - 1)
+                        can_pre = torch.full((2048,), canary_val, dtype=torch.int64, device="cuda")
                         xg = inp0.clone().requires_grad_(True)
-                        can_post = torch.full((2048,), 0x76543210FEDCBA98 & ((1 << 63) - 1), dtype=torch.int64, device="cuda")
+                        can_post = torch.full((2048,), canary_val, dtype=torch.int64, device="cuda")
                         lg = F.cross_entropy(xg, tgt, reduction=reduction, ignore_index=-100)
                         if reduction == "none":
                             lg.backward(grad_w)
@@ -206,7 +210,10 @@ def test_fused_adam_fp32_and_bf16_zero_recompile():
 
                 for gp, rp in zip(gems_ps, ref_ps):
                     c = cos_sim(gp, rp)
-                    assert c >= cos_thr, f"Adam mismatch dtype={dtype} amsgrad={amsgrad} shape={tuple(gp.shape)} cos={c}"
+                    assert c >= cos_thr, (
+                        f"Adam mismatch dtype={dtype} amsgrad={amsgrad} "
+                        f"shape={tuple(gp.shape)} cos={c}"
+                    )
     if orig_cache is not None:
         os.environ["TRITON_CACHE_DIR"] = orig_cache
     print("  Adam(fused=True) OK")
@@ -246,6 +253,12 @@ def test_thead_sdpa_overrideable_bucketing_no_recompile():
             os.environ["TRITON_CACHE_DIR"] = tdir
             triton.knobs.autotuning.shape_bucketing = True
             triton.knobs.autotuning.shape_bucketing_mode = "training"
+            sdpa_mod = sys.modules.get(
+                "_thead.ops._scaled_dot_product_fused_attention_overrideable"
+            )
+            if sdpa_mod is not None:
+                sdpa_mod._sdpa_fwd_c.device_caches.clear()
+                sdpa_mod._sdpa_fwd.device_caches.clear()
             with flag_gems.use_gems():
                 counts = []
                 for L in (64, 128, 264, 276, 384, 524):
@@ -254,13 +267,36 @@ def test_thead_sdpa_overrideable_bucketing_no_recompile():
                     v = torch.randn(2, 8, L, 64, device="cuda", dtype=torch.bfloat16)
                     _ = torch.ops.aten._scaled_dot_product_fused_attention_overrideable(q, k, v)
                     torch.cuda.synchronize()
-                    counts.append((L, _hgbin_count(tdir, "_sdpa_fwd"), _hgbin_count(tdir, "_sdpa_fwd_c")))
+                    counts.append(
+                        (L, _hgbin_count(tdir, "_sdpa_fwd"), _hgbin_count(tdir, "_sdpa_fwd_c"))
+                    )
                 print("  _sdpa_fwd counts across L:", counts)
-                assert all(c_c == 0 for _, _, c_c in counts), f"_sdpa_fwd_c should not compile under bucketing: {counts}"
-                # One %16==0 variant (64,128,384) and at most one %16!=0 variant (264,276,524).
-                assert counts[-1][1] <= 2 and counts[3][1] == counts[2][1] and counts[5][1] == counts[4][1], (
-                    f"_sdpa_fwd recompiled beyond alignment classes: {counts}"
-                )
+                # Contiguous fast path (_sdpa_fwd_c) runs with runtime L/S and compiles
+                # at most once per alignment class (<=2 total across 6 variable lengths).
+                assert counts[-1][2] >= 1, f"_sdpa_fwd_c did not execute on contiguous inputs: {counts}"
+                assert (
+                    counts[-1][1] <= 2
+                    and counts[-1][2] <= 2
+                    and counts[3][2] == counts[2][2]
+                    and counts[5][2] == counts[4][2]
+                ), f"_sdpa_fwd_c recompiled beyond alignment classes: {counts}"
+            # Verify numerical parity vs ATen across variable unaligned lengths
+            for is_causal in (False, True):
+                for S in (45, 92, 188, 250):
+                    torch.manual_seed(400 + S)
+                    q = torch.randn(2, 8, S, 64, device="cuda", dtype=torch.bfloat16)
+                    k = torch.randn(2, 8, S, 64, device="cuda", dtype=torch.bfloat16)
+                    v = torch.randn(2, 8, S, 64, device="cuda", dtype=torch.bfloat16)
+                    ref = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+                    with flag_gems.use_gems():
+                        out = torch.ops.aten._scaled_dot_product_fused_attention_overrideable(
+                            q, k, v, is_causal=is_causal
+                        )[0]
+                        torch.cuda.synchronize()
+                    c_sdpa = cos_sim(out, ref)
+                    assert torch.isfinite(out).all() and c_sdpa >= 0.999, (
+                        f"SDPA overrideable mismatch S={S} causal={is_causal}: cos={c_sdpa}"
+                    )
         finally:
             triton.knobs.autotuning.shape_bucketing = old_bkt
             triton.knobs.autotuning.shape_bucketing_mode = old_mode
@@ -288,7 +324,13 @@ def test_mse_loss_backward_all_reductions():
                     lg.backward(g_out)
                     torch.cuda.synchronize()
 
-                assert torch.allclose(lg.detach().float(), la.detach().float(), rtol=(1e-4 if dtype == torch.float32 else 2e-2), atol=diff_thr), f'MSE loss diff {shape} {dtype} {reduction}: {lg.item()} vs {la.item()}'
+                mse_rtol = 1e-4 if dtype == torch.float32 else 2e-2
+                assert torch.allclose(
+                    lg.detach().float(),
+                    la.detach().float(),
+                    rtol=mse_rtol,
+                    atol=diff_thr,
+                ), f"MSE loss diff {shape} {dtype} {reduction}: {lg.item()} vs {la.item()}"
                 c = cos_sim(xg.grad, xa.grad)
                 assert c >= cos_thr, f"MSE backward mismatch {dtype} {shape} {reduction}: cos={c}"
     print("  MSELoss backward OK")
@@ -305,7 +347,12 @@ def test_sdpa_backward_with_dropout():
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.1, is_causal=False)
         out.backward(dout)
         torch.cuda.synchronize()
-    assert torch.isfinite(out).all() and torch.isfinite(q.grad).all() and torch.isfinite(k.grad).all() and torch.isfinite(v.grad).all()
+    assert (
+        torch.isfinite(out).all()
+        and torch.isfinite(q.grad).all()
+        and torch.isfinite(k.grad).all()
+        and torch.isfinite(v.grad).all()
+    )
     print("  SDPA dropout backward OK")
 
 
@@ -391,6 +438,34 @@ def test_select_backward_and_pad_zero_recompile():
     print("  select_backward & F.pad zero-recompile OK")
 
 
+def test_bmm_split_k_warm_cache_uses_launch_meta():
+    print("[11] Testing _thead bmm split-K warm cache uses launch_meta['SPLIT_K']...")
+    bmm_mod = sys.modules.get("_thead.ops.bmm")
+    assert bmm_mod is not None, "_thead.ops.bmm module not loaded"
+    torch.manual_seed(42)
+    a1 = torch.randn(2, 64, 16384, device="cuda", dtype=torch.bfloat16) * 0.01
+    b1 = torch.randn(2, 16384, 256, device="cuda", dtype=torch.bfloat16) * 0.01
+    ref1 = torch.bmm(a1, b1)
+
+    a2 = torch.randn(2, 64, 8256, device="cuda", dtype=torch.bfloat16) * 0.01
+    b2 = torch.randn(2, 8256, 256, device="cuda", dtype=torch.bfloat16) * 0.01
+    ref2 = torch.bmm(a2, b2)
+    torch.cuda.synchronize()
+
+    with flag_gems.use_gems():
+        out1_cold = torch.bmm(a1, b1)
+        out2 = torch.empty((2, 64, 256), device="cuda", dtype=torch.bfloat16)
+        bmm_mod._run_ppu_bmm_split_k(a2, b2, out2, out2, 1.0, 0.0, False)
+        out1_warm = torch.bmm(a1, b1)
+        torch.cuda.synchronize()
+
+    assert cos_sim(out1_cold, ref1) >= 0.999
+    assert cos_sim(out2, ref2) >= 0.999
+    c_warm = cos_sim(out1_warm, ref1)
+    assert c_warm >= 0.999, f"bmm split-K stale SPLIT_K on warm hit: cos={c_warm}"
+    print("  bmm split-K launch_meta OK")
+
+
 if __name__ == "__main__":
     torch.cuda.set_device(0)
     test_layernorm_3d_4d_no_oob()
@@ -403,4 +478,5 @@ if __name__ == "__main__":
     test_sdpa_backward_with_dropout()
     test_linear_backward_noncontiguous()
     test_select_backward_and_pad_zero_recompile()
+    test_bmm_split_k_warm_cache_uses_launch_meta()
     print("ALL TRAINING OP UNIT TESTS PASSED!")

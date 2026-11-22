@@ -22,7 +22,8 @@ from typing import Any, Dict, List
 
 _PATTERNS = {
     "shape_stride_constexpr": re.compile(
-        r"\b(M|N|K|L|S|B|SEQ_LEN|N_CTX|n_elements|numel|total|inner_size|outer_size|stride_[a-z0-9_]+|x_shape\d|shape_\d)\s*:\s*tl\.constexpr"
+        r"\b(M|N|K|L|S|B|SEQ_LEN|N_CTX|n_elements|numel|total|inner_size|"
+        r"outer_size|stride_[a-z0-9_]+|x_shape\d|shape_\d)\s*:\s*tl\.constexpr"
     ),
     "wrapper_divisibility_kw": re.compile(
         r"\b(EVEN_[A-Z0-9_]+|ALIGNED_[A-Z0-9_]+|DIVISIBLE_[A-Z0-9_]+)\s*="
@@ -90,7 +91,12 @@ def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FlagGems shape-bucketing compliance scanner")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--json", dest="json_out", type=Path, default=None)
-    parser.add_argument("--strict-paths", nargs="*", default=None, help="Fail if any listed relative paths have findings")
+    parser.add_argument(
+        "--strict-paths",
+        nargs="*",
+        default=None,
+        help="Fail if any listed relative paths have findings",
+    )
     args = parser.parse_args(argv)
 
     report = scan_flaggems(args.root)

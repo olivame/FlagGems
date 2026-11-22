@@ -644,5 +644,117 @@ class TestLibEntryFlagTreeBucketing(unittest.TestCase):
             self.assertEqual(len(entry._bkt_l0_bucket_cache), 1)
             self.assertEqual(len(entry.kernel_cache[0]), 1)
 
+    def test_dispatch_guard_l0_l1_participation_and_no_double_negotiate(self):
+        """When distributed_dispatch_guard=True, L0/L1/miss all negotiate exactly once;
+        when False (default), zero collectives execute on hot paths."""
+        from triton.runtime._distributed import DistributedDispatchGuard, RankDispatchState
+
+        src = """
+        def guarded_kern(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+            pass
+        """
+        jit_fn = _FakeJIT(src)
+        tuner = lib.LibTuner.get("default")(
+            jit_fn,
+            jit_fn.arg_names,
+            [Config({"BLOCK_SIZE": 64}), Config({"BLOCK_SIZE": 128})],
+            ["n_elements"],
+            strategy=["default"],
+            reset_to_zero=None,
+            restore_value=None,
+            do_bench=lambda fn_call, quantiles=None: [0.05, 0.04, 0.06],
+        )
+        tuner.cache = {}
+        entry = _build_synthetic_libentry(tuner, jit_fn, cache_binding=True)
+
+        seen_states = []
+        barriers = []
+
+        def fake_all_reduce(mask: int) -> int:
+            seen_states.append(RankDispatchState(mask))
+            return mask
+
+        guard = DistributedDispatchGuard(
+            world_size=2,
+            rank=0,
+            all_reduce_or_fn=fake_all_reduce,
+            barrier_fn=lambda: barriers.append(1),
+        )
+        tuner.dispatch_guard = guard
+        x = _make_tensor()
+
+        with triton.knobs.autotuning.scope():
+            triton.knobs.autotuning.shape_bucketing = True
+            triton.knobs.autotuning.shape_bucketing_mode = "inference"
+            triton.knobs.autotuning.adjust_block_size = False
+            triton.knobs.autotuning.distributed_dispatch_guard = True
+
+            # 1) Cold L1 miss -> exactly 1 negotiate(ANY_COLD_COMPILE), no inner double-negotiate!
+            entry.run(x, 128, grid=(2,))
+            self.assertEqual(guard.negotiation_count, 1)
+            self.assertEqual(seen_states[-1], RankDispatchState.ANY_COLD_COMPILE)
+            self.assertEqual(len(barriers), 2)
+
+            # 2) L0 hit -> exactly 1 negotiate(ALL_HOT_HIT), no barrier
+            self.assertGreaterEqual(len(entry._bkt_l0_cache), 1)
+            entry.run(x, 128, grid=(2,))
+            self.assertEqual(guard.negotiation_count, 2)
+            self.assertEqual(seen_states[-1], RankDispatchState.ALL_HOT_HIT)
+            self.assertEqual(len(barriers), 2)
+
+            # 3) L1 hit (L0 cleared) -> exactly 1 negotiate(ALL_HOT_HIT)
+            entry._bkt_l0_cache.clear()
+            entry._bkt_l0_bucket_cache.clear()
+            entry.run(x, 128, grid=(2,))
+            self.assertEqual(guard.negotiation_count, 3)
+            self.assertEqual(seen_states[-1], RankDispatchState.ALL_HOT_HIT)
+
+            # 4) bucketing=False with cache_binding=True must NOT bypass guard via _run_cached
+            triton.knobs.autotuning.shape_bucketing = False
+            entry.run(x, 128, grid=(2,))
+            entry.run(x, 128, grid=(2,))
+            self.assertEqual(guard.negotiation_count, 5)
+
+            # 5) Default guard=False fast path performs zero collectives
+            triton.knobs.autotuning.shape_bucketing = True
+            triton.knobs.autotuning.distributed_dispatch_guard = False
+            entry.run(x, 128, grid=(2,))
+            entry.run(x, 128, grid=(2,))
+            self.assertEqual(guard.negotiation_count, 5)
+
+    def test_sdpa_and_bmm_splitk_regression_guards(self):
+        """Static regression guard for _thead SDPA (no bucketing NameError, runtime L/S)
+        and _thead bmm split-K (reads launch_meta['SPLIT_K'], not stale best_config)."""
+        fg_root = Path(__file__).resolve().parents[1]
+
+        sdpa_path = (
+            fg_root
+            / "src/flag_gems/runtime/backend/_thead/ops"
+            / "_scaled_dot_product_fused_attention_overrideable.py"
+        )
+        sdpa_src = sdpa_path.read_text(encoding="utf-8")
+        self.assertNotIn("shape_bucketing", sdpa_src)
+        sdpa_tree = ast.parse(sdpa_src)
+        for node in ast.walk(sdpa_tree):
+            if isinstance(node, ast.Name):
+                self.assertNotEqual(node.id, "bucketing")
+            if isinstance(node, ast.FunctionDef) and node.name == "_sdpa_fwd_c":
+                ann_by_arg = {
+                    a.arg: (ast.unparse(a.annotation) if a.annotation is not None else None)
+                    for a in node.args.args
+                }
+                self.assertIsNone(ann_by_arg.get("L"))
+                self.assertIsNone(ann_by_arg.get("S"))
+
+        bmm_path = fg_root / "src/flag_gems/runtime/backend/_thead/ops/bmm.py"
+        bmm_tree = ast.parse(bmm_path.read_text(encoding="utf-8"))
+        splitk_fn = next(
+            n for n in bmm_tree.body if isinstance(n, ast.FunctionDef) and n.name == "_run_ppu_bmm_split_k"
+        )
+        splitk_src = ast.unparse(splitk_fn)
+        self.assertIn("launch_meta", splitk_src)
+        self.assertNotIn("best_config", splitk_src)
+
+
 if __name__ == "__main__":
     unittest.main()

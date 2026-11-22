@@ -143,8 +143,8 @@ def _sdpa_fwd(
 
 # ---------------------------------------------------------------------------
 # Contiguous fast path: q,k,v,o are contiguous (B,H,L,D)/(B,H,S,D)/(B,H,S,DV).
-# H, L, S, D, DV are compile-time so masks fold away when shapes are block
-# multiples and launch marshaling drops to 9 runtime args.
+# H, D, DV are compile-time; L and S are runtime arguments so variable
+# sequence lengths reuse compiled kernels without per-shape specialization.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _sdpa_fwd_c(
@@ -159,8 +159,8 @@ def _sdpa_fwd_c(
     sb2,
     sb3,
     H: tl.constexpr,
-    L: tl.constexpr,
-    S: tl.constexpr,
+    L,
+    S,
     D: tl.constexpr,
     DV: tl.constexpr,
     scale,
@@ -362,8 +362,7 @@ def _scaled_dot_product_fused_attention_overrideable(
         bias_ptr = q
 
     if (
-        not bucketing
-        and q.is_contiguous()
+        q.is_contiguous()
         and k.is_contiguous()
         and v.is_contiguous()
         and out.is_contiguous()
