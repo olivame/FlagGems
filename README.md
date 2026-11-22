@@ -68,6 +68,15 @@ Check the [features](https://flagos-ai.github.io/FlagGems/overview/features/) do
 - Llama-2-7b
 - Llava-1.5-7b
 
+## Dynamic Shape Bucketing (F09)
+
+FlagGems integrates the FlagTree universal dynamic shape-bucketing runtime for variable-length LLM inference and training:
+
+- Quick Start & Usage (CN / EN): [docs/f09_shape_bucketing/README.md](./docs/f09_shape_bucketing/README.md)
+- Architecture, Upgrade Guide & Known Issues: [docs/f09_shape_bucketing/DESIGN_AND_KNOWN_ISSUES.md](./docs/f09_shape_bucketing/DESIGN_AND_KNOWN_ISSUES.md)
+- F09 Changelog: [docs/f09_shape_bucketing/CHANGELOG.md](./docs/f09_shape_bucketing/CHANGELOG.md)
+- Static Compliance Scanner & Portable Runner: `tools/check_bucketing_compliance.py`, `benchmarks/f09_acceptance_runner.py`
+
 ## Contribution
 
 <!--TODO(Qiming): replicate this to other repo.-->
