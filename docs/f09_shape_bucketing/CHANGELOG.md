@@ -2,6 +2,29 @@
 
 All notable F09 dynamic shape-bucketing changes on top of upstream FlagGems `master` (`4d3d9f70`).
 
+## [v0.3.0-f09] — 2026-11-23
+
+### Installer Sync & Release Notes (`fix/f09-v030-installer-and-docs`)
+- **Portable Installer (`tools/install_f09_editable.sh`)**:
+  - Added `flagtune/runtime/comm_profiler.py` and `flagtune/runtime/parallel_executor.py` to `F09_TRITON_FILES`
+    so isolated `--target` (and explicit `--allow-in-place-triton-overlay`) installations deploy the complete
+    FlagTree **`v0.3.0-f09`** (`386e29ea60`) multi-card runtime stack (20 F09 FlagTree runtime files total).
+  - Preserved default non-destructive refusal (`rc=2`) when `--target` is omitted without
+    `--allow-in-place-triton-overlay`; verified `bash -n tools/install_f09_editable.sh` PASS and 0 lines `>120` chars.
+- **Release Docs (`docs/f09_shape_bucketing/{CHANGELOG.md, README.md, DESIGN_AND_KNOWN_ISSUES.md}`)**:
+  - Documented `v0.3.0-f09` compatibility with FlagTree **`v0.3.0-f09`** (`386e29ea60`) Phase 3 multi-card features:
+    - **F09-G04 (`025903bf12`)**: real 4× PPU-ZW810E comm profiler (`comm_profiler.py`), calibrated & explainable
+      `PartitionPlanner` (`HYBRID_DP_PP`, 3/3 Top-1 match, mean `spearman_rho -0.40 -> +0.90`, `1.63×–26.83×`
+      speedup over uncalibrated/naive baselines), and live DP/TP/PP/2D Hybrid `ParallelPlanExecutor`
+      (`min_parity_cos = 0.999844`).
+    - **F09-G05 (`ca4d466c87`)**: bounded `comm_timeout_s` (`FLAGTREE_COMM_TIMEOUT_SEC`), structured
+      `DistributedCommTimeoutError` / `DistributedRankFaultError`, `ProcessGroupGloo` teardown race fix
+      (`cleanup_after_fault`), and `CoordinatedStepGuard` cross-rank asymmetric OOM recovery (4× PPU `SIGKILL`
+      `0.54s`, `12s` stall `3.01s`, `S=2047` asymmetric OOM `0.24s` with `max_rank_param_diff=0.0`, 18-step
+      long-tail soak `0` hangs).
+  - Zero `src/flag_gems/` operator or runtime files modified in this commit (operator runtime remains bit-identical
+    to `FG-P1-B` `a4ee460e42`, preserving 25/25 PPU tests and 0 `op_level_bucketing_branch` across all 3 domains).
+
 ## [v0.2.0-f09] — 2026-11-22
 
 ### Documentation & Release Notes (`docs/f09-v020-release-notes`)

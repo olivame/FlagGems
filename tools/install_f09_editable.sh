@@ -69,6 +69,8 @@ F09_TRITON_FILES=(
   runtime/shape_profiler.py
   flagtune/__init__.py
   flagtune/runtime/autotuner.py
+  flagtune/runtime/comm_profiler.py
+  flagtune/runtime/parallel_executor.py
   flagtune/runtime/partition_planner.py
 )
 

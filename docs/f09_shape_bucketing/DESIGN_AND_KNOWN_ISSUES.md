@@ -52,7 +52,7 @@ PyTorch Op Call (e.g. F.linear / F.layer_norm / SDPA / bmm)
 ## 2. 上游同步与补丁维护指南
 
 当上游 `FlagGems` `master` 推进并需要迁移 F09 补丁栈时，建议按以下顺序操作：
-1. **按顺序变基/合入补丁栈**：从基线 `4d3d9f70` 起依次应用 PR-1（`libentry.py` + `pointwise_dynamic.py`）、PR-2（算子零重编译与反向修复）、PR-3（合规扫描器）、Fix-1、Fix-2、Docs/Runner (`v0.1.0-f09`)、FG-P1-A (`13590357eb`)、FG-P1-B (`a4ee460e42`) 与 `v0.2.0-f09` Docs 提交（共 9 个有序提交）。
+1. **按顺序变基/合入补丁栈**：从基线 `4d3d9f70` 起依次应用 PR-1（`libentry.py` + `pointwise_dynamic.py`）、PR-2（算子零重编译与反向修复）、PR-3（合规扫描器）、Fix-1、Fix-2、Docs/Runner (`v0.1.0-f09`)、FG-P1-A (`13590357eb`)、FG-P1-B (`a4ee460e42`)、`v0.2.0-f09` Docs (`ab85d9f5a2`) 与 `v0.3.0-f09` Installer/Docs 同步提交（共 10 个有序提交）。
 2. **重点冲突检查点**：
    - `src/flag_gems/utils/libentry.py`：保留 `_coordinate_dispatch_guard`、2-tier L0 缓存以及 `LibEntry.run()` 统一返回 `(kernel, constexprs)` 契约；
    - `_thead/ops/_scaled_dot_product_fused_attention_overrideable.py`：确认 `_sdpa_fwd_c` 的 `L, S` 保持非 `tl.constexpr` 且无 `shape_bucketing` 分支；
@@ -78,3 +78,4 @@ PyTorch Op Call (e.g. F.linear / F.layer_norm / SDPA / bmm)
 > **配套 FlagTree `v0.2.0-f09` 已闭环项联动说明**：
 > - **FlagTree KI-07（`IntervalPolicy` Auto-PGO & `GraphBucketCompiler`/`DecodeGraphBucketRunner`）— RESOLVED in `v0.2.0-f09`** (`FT-P1-A` `9b92bd75dc`)：联合 FlagGems `a4ee460e42` 在 PPU-10/11 完成真实模型 Auto-PGO V2 闭环实证（`USE_FLAGTUNE_COST_MODEL=0`）— `bge_reranker_v2_m3`（`11,109` 真实样本、`4/4` 组、`7/7` `ft_pgo_v1` 命中）`COLD_TUNED 33->14 (-57.6%)`、冷启 `60,108.1->54,073.0 ms (1.11×)`、未见长度 `13,400.7->274.6 ms (48.80×, 0 new_hgbin, 0 cold_tuned)`、稳态 `1.115×`（`cos_vs_aten=0.999983`）；`qwen3_embedding_0_6b`（`43,659` 真实样本、`5/5` 组、`10/10` `ft_pgo_v1` 命中）6 档 `COLD_TUNED 65->38 (-41.5%)`、冷启 `104,355.2->91,892.7 ms (1.14×)`、未见长度 `2,582.3->1,667.9 ms (19.47×)`、稳态 `1.105×`（超越 ON `1.092×`）、`min_cos_pgo_vs_off=1.000000`，策略全覆盖 7 档 A/B `1,995.0 ms vs 1,994.6 ms`（`1.000×` 精确持平、`0` 调优）。
 > - **FlagTree KI-08（多进程共享 `TRITON_CACHE_DIR` 磁盘淘汰竞态）— RESOLVED in `v0.2.0-f09`** (`FT-P1-B` `e4522a5fc1`)：新增 POSIX `fcntl.flock` + `threading.RLock` 混合锁与 100% 无锁热读，6 进程并发淘汰压测 `15 FileNotFoundError -> 0`。
+> - **配套 FlagTree `v0.3.0-f09` (`386e29ea60`) Phase 3 多卡能力联动**：`F09-G04` (`025903bf12`) 落地 `comm_profiler.py`、通信校准可解释 `PartitionPlanner` 与 4× PPU 实跑 `ParallelPlanExecutor`（关闭单机多卡 KI-04）；`F09-G05` (`ca4d466c87`) 为 `DistributedDispatchGuard` 补齐 `comm_timeout_s` 有界超时熔断、对端故障隔离与 `CoordinatedStepGuard` 跨卡 OOM 协同恢复（全面加固 KI-06）；本仓 `tools/install_f09_editable.sh` 已同步覆盖全部 20 个 FlagTree F09 运行时文件。

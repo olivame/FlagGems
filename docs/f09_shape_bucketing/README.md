@@ -40,6 +40,7 @@ export PYTHONPATH="/tmp/f09_target:${PYTHONPATH:-}"
 | `FLAGTREE_SHAPE_BUCKETING` | `0` | 设为 `1` 开启 FlagTree + FlagGems 动态 shape 分桶 |
 | `FLAGTREE_SHAPE_BUCKETING_MODE` | `inference` | `inference`（低延迟在线分桶）或 `training`（保护前后向步幅与梯度算子） |
 | `FLAGTREE_DISTRIBUTED_DISPATCH_GUARD` | `0` | 多卡并行时设为 `1` 开启跨 Rank 编译协商守卫（默认 `0` 零集合开销） |
+| `FLAGTREE_COMM_TIMEOUT_SEC` | 未设置 | FlagTree `v0.3.0-f09` 多卡守卫与 `CoordinatedStepGuard` 的有界通信超时秒数 |
 | `USE_FLAGTUNE_COST_MODEL` | 未设置 | **离线/受限网络环境强烈建议设为 `0`**，避免 FlagTune 远程拉取 cost-model 压缩包超时 |
 
 ### 5. 最小可复现示例与预期输出
@@ -102,7 +103,7 @@ Key components in this repository:
 - `src/flag_gems/utils/libentry.py`: 2-tier L0 cache (exact Tier 0 + bucket Tier 0.5), `BucketCacheBudget`, and re-entrant `DistributedDispatchGuard` coordination across L0/L1 hits and cold misses.
 - `src/flag_gems/utils/pointwise_dynamic.py`: Dual-path bucket-aware codegen.
 - `tools/check_bucketing_compliance.py`: Static compliance scanner and CI gate (`--strict-paths`).
-- `tools/install_f09_editable.sh`: Portable isolated `--target` installer with non-destructive site-packages safeguard.
+- `tools/install_f09_editable.sh`: Portable isolated `--target` installer with non-destructive site-packages safeguard (synced for FlagTree `v0.3.0-f09`, including `comm_profiler.py` and `parallel_executor.py`).
 - `benchmarks/f09_acceptance_runner.py`: Standalone, hardcoded-path-free acceptance runner supporting `--model-dir` and `--synthetic-fallback` across `infer`, `train`, and `decode` modes.
 
 ### 2. Installation (Isolated `--target`, Recommended)
