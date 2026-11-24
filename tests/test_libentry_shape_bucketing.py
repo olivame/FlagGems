@@ -887,5 +887,115 @@ class TestLibEntryFlagTreeBucketing(unittest.TestCase):
             cnt = rep["by_scope"][scope]["rule_file_counts"].get("op_level_bucketing_branch", 0)
             self.assertEqual(cnt, 0, f"Unexpected op_level_bucketing_branch in {scope}")
 
+
+    def test_v031_alignment_contract_and_raw_key_fallback(self):
+        """LibEntry must pass _bkt_force_unaligned_indices on cold miss and never
+        store aligned binaries under an unaligned-compatible key or L0 bucket cache."""
+        from types import SimpleNamespace
+
+        class _FakeParam:
+            def __init__(self, name, is_constexpr=False, do_not_specialize=False):
+                self.name = name
+                self.is_constexpr = is_constexpr
+                self.do_not_specialize = do_not_specialize
+                self.default = inspect._empty
+
+        class _FakeKernel:
+            def __init__(self, aligned_indices):
+                self.src = SimpleNamespace(
+                    attrs={(idx,): [["tt.divisibility", 16]] for idx in aligned_indices}
+                )
+                self.launches = []
+            def __getitem__(self, grid):
+                return lambda *a: self.launches.append((grid, a))
+
+        compiled_calls = []
+
+        class _FakeJIT(triton.runtime.JITFunction):
+            __name__ = "fake_align_kernel"
+            def __init__(self):
+                self.params = [
+                    _FakeParam("M"),
+                    _FakeParam("stride_k"),
+                    _FakeParam("TILE", is_constexpr=True),
+                ]
+                self.arg_names = ["M", "stride_k", "TILE"]
+                self.signature = inspect.Signature([
+                    inspect.Parameter("M", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                    inspect.Parameter("stride_k", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                    inspect.Parameter("TILE", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                ])
+                self._bkt_force_unaligned_indices = None
+                self._bkt_last_run_used_exact_aligned = False
+                self._return_exact_aligned = False
+                self._src = "def fake_align_kernel(M, stride_k, TILE):\n    pass\n"
+                self.fn = lambda M, stride_k, TILE: None
+                self.module = __name__
+            def run(self, *args, **kwargs):
+                forced = set(self._bkt_force_unaligned_indices or ())
+                compiled_calls.append((args, kwargs.get("TILE"), forced))
+                if self._return_exact_aligned:
+                    self._bkt_last_run_used_exact_aligned = True
+                    return _FakeKernel(aligned_indices={0})
+                self._bkt_last_run_used_exact_aligned = False
+                aligned = {
+                    i for i, v in enumerate(args)
+                    if type(v) is int and v > 1 and v % 16 == 0 and i not in forced
+                }
+                return _FakeKernel(aligned_indices=aligned)
+
+        jf = _FakeJIT()
+        entry = object.__new__(lib.LibEntry)
+        entry.fn = jf
+        entry.jit_function = jf
+        entry.signature = jf.signature
+        entry.arg_names = jf.arg_names
+        entry.divisibility = 16
+        entry.specialize_indices = {0, 1}
+        entry.do_not_specialize_indices = set()
+        entry.constexpr_indices = {2}
+        entry._tensor_spec_fn = None
+        entry._cache_binding = False
+        entry._has_flagtune_tuner = False
+        entry.kernel_cache = [{}]
+        entry._cpu_cache = {}
+        entry.lock = threading.Lock()
+        entry.dispatch_guard = None
+
+        prev_bkt = triton.knobs.autotuning.shape_bucketing
+        try:
+            triton.knobs.autotuning.shape_bucketing = True
+            with unittest.mock.patch.object(lib.torch_device_fn, "current_device", return_value=0):
+                # 1. Unaligned M=328 (TILE=128) marks M unaligned globally
+                entry.run(328, 64, TILE=128, grid=(1,))
+                # 2. New constexpr TILE=256 sees aligned M=1008 -> LibEntry MUST force idx 0 unaligned
+                k2, _ = entry.run(1008, 64, TILE=256, grid=(1,))
+                self.assertEqual(len(compiled_calls), 2)
+                self.assertIn(0, compiled_calls[-1][2])
+                self.assertFalse(entry._kernel_has_divisibility_on(k2, {0}))
+                # 3. Unaligned M=812 (TILE=256) reuses the unaligned-safe binary (0 violations)
+                k3, _ = entry.run(812, 64, TILE=256, grid=(1,))
+                self.assertEqual(len(compiled_calls), 2)
+                self.assertIs(k3, k2)
+
+                # 4. If JIT reuses an exact-aligned binary, soundness gate redirects to raw_entry_key
+                entry2 = object.__new__(lib.LibEntry)
+                entry2.__dict__.update(entry.__dict__)
+                entry2.kernel_cache = [{}]
+                entry2._bkt_l0_cache = {}
+                entry2._bkt_l0_bucket_cache = {}
+                entry2._ft_entry_bucket_meta = None
+                jf._return_exact_aligned = False
+                entry2.run(328, 64, TILE=128, grid=(1,))
+                jf._return_exact_aligned = True
+                k_exact, _ = entry2.run(1008, 64, TILE=256, grid=(1,))
+                # Subsequent unaligned M=812 MUST NOT hit aligned-only k_exact!
+                jf._return_exact_aligned = False
+                k_unaligned, _ = entry2.run(812, 64, TILE=256, grid=(1,))
+                self.assertIsNot(k_unaligned, k_exact)
+                self.assertFalse(entry2._kernel_has_divisibility_on(k_unaligned, {0}))
+        finally:
+            triton.knobs.autotuning.shape_bucketing = prev_bkt
+
 if __name__ == "__main__":
     unittest.main()

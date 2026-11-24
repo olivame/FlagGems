@@ -2005,6 +2005,27 @@ class LibEntry(triton.KernelInterface):
         except Exception:
             pass
 
+    def _get_jit_param_index_map(self):
+        mp = getattr(self, "_ft_jit_param_index_map", None)
+        if mp is None:
+            params = getattr(self.jit_function, "params", ()) or ()
+            mp = {p.name: i for i, p in enumerate(params)}
+            self._ft_jit_param_index_map = mp
+        return mp
+
+    @staticmethod
+    def _kernel_has_divisibility_on(kernel, indices):
+        if not indices or kernel is None:
+            return False
+        src = getattr(kernel, "src", None)
+        attrs = getattr(src, "attrs", None) if src is not None else None
+        if isinstance(attrs, dict):
+            for k, v in attrs.items():
+                if isinstance(k, tuple) and len(k) == 1 and k[0] in indices:
+                    if any("divisibility" in str(a) for a in v):
+                        return True
+        return False
+
     def _normalize_spec_and_heur_for_key(
         self,
         spec_names,
@@ -2012,15 +2033,27 @@ class LibEntry(triton.KernelInterface):
         const_args,
         all_named_args,
     ):
-        """Normalize specialized int scalars and pre-evaluate heuristics when bucketing is on."""
+        """Normalize specialized int scalars and pre-evaluate heuristics when bucketing is on.
+
+        Returns ``(stripped_jit_indices, raw_spec_args, raw_const_args)`` so
+        ``LibEntry.run`` can (1) reuse an already-compiled aligned/raw entry if
+        present (preserving static-axis cache hits), and (2) instruct
+        ``JITFunction`` to strip divisibility specialization on every
+        ``stripped_jit_indices`` parameter during cold compilation so an aligned
+        binary can never be cached under an unaligned-compatible entry key.
+        """
         policy, autotune_keys, heuristics_nodes = self._get_bucketing_meta()
         if hasattr(policy, "observe_args"):
             policy.observe_args(all_named_args)
         heur_failed = False
+        raw_const_args = list(const_args)
+        heur_changed = False
         if heuristics_nodes:
             from triton.runtime.shape_bucketing import evaluate_heuristics_for_bucketing
             heur_items = []
+            raw_heur_items = []
             merged_env = dict(all_named_args)
+            raw_env = dict(all_named_args)
             try:
                 for h_node in reversed(heuristics_nodes):
                     h_node._ft_bucket_policy = policy
@@ -2030,23 +2063,62 @@ class LibEntry(triton.KernelInterface):
                     for h_k, h_val in evaluated.items():
                         merged_env[h_k] = h_val
                         heur_items.append((h_k, h_val))
+                    for h_k, h_fn in h_node.values.items():
+                        r_val = h_fn(raw_env)
+                        raw_env[h_k] = r_val
+                        raw_heur_items.append((h_k, r_val))
             except Exception:
                 heur_failed = True
             else:
                 if heur_items:
                     const_args.append(("ft_heur",) + tuple(heur_items))
+                    raw_const_args.append(("ft_heur",) + tuple(raw_heur_items))
+                    heur_changed = heur_items != raw_heur_items
 
+        stripped_jit_indices = set()
+        raw_spec_args = list(spec_args)
+        div = self.divisibility
+        pidx_map = self._get_jit_param_index_map()
         for idx, (pname, val) in enumerate(zip(spec_names, spec_args)):
             if type(val) is int:
                 treat_as_tuned = (pname in autotune_keys) or heur_failed
-                spec_args[idx] = _NormalizedSpecScalar(
-                    policy.normalize_entry_scalar(
-                        pname,
-                        val,
-                        is_autotuned_key=treat_as_tuned,
-                        all_args=all_named_args,
-                    )
+                tok = policy.normalize_entry_scalar(
+                    pname,
+                    val,
+                    is_autotuned_key=treat_as_tuned,
+                    all_args=all_named_args,
                 )
+                spec_args[idx] = _NormalizedSpecScalar(tok)
+                if (
+                    val > 0
+                    and val != 1
+                    and (val % div) == 0
+                    and isinstance(tok, tuple)
+                    and len(tok) >= 4
+                    and isinstance(tok[0], str)
+                    and tok[0].startswith("ft_")
+                    and tok[-2] is False
+                ):
+                    jidx = pidx_map.get(pname)
+                    if jidx is not None:
+                        stripped_jit_indices.add(jidx)
+                    if (
+                        tok[0] == "ft_tune_stride"
+                        and isinstance(tok[1], tuple)
+                        and len(tok[1]) >= 3
+                        and tok[1][-1] is False
+                    ):
+                        raw_stride_tok = tok[1][:-1] + (True,)
+                        raw_tok = (tok[0], raw_stride_tok) + tok[2:-2] + (True, tok[-1])
+                    else:
+                        raw_tok = tok[:-2] + (True, tok[-1])
+                    raw_spec_args[idx] = _NormalizedSpecScalar(raw_tok)
+                else:
+                    raw_spec_args[idx] = spec_args[idx]
+        if not stripped_jit_indices and not heur_changed:
+            raw_spec_args = None
+            raw_const_args = None
+        return stripped_jit_indices, raw_spec_args, raw_const_args
 
     def key(self, spec_args, dns_args, const_args):
         def spec_arg(arg):
@@ -2455,13 +2527,21 @@ class LibEntry(triton.KernelInterface):
             )
 
         all_named_args = None
+        stripped_jit_indices = ()
+        raw_entry_key = None
+        used_raw_entry = False
         if bucketing_active:
             all_named_args = {**dict(zip(param_names, args)), **kwargs, **k_args}
-            self._normalize_spec_and_heur_for_key(
+            stripped_jit_indices, raw_spec_args, raw_const_args = self._normalize_spec_and_heur_for_key(
                 spec_names, spec_args, const_args, all_named_args
             )
             if not callable(grid) and _is_xpu_static_grid_backend():
-                const_args.append(("xpu_baked_grid", _canonicalize_static_grid(grid)))
+                xpu_g = ("xpu_baked_grid", _canonicalize_static_grid(grid))
+                const_args.append(xpu_g)
+                if raw_const_args is not None:
+                    raw_const_args.append(xpu_g)
+            if raw_spec_args is not None and raw_const_args is not None:
+                raw_entry_key = self.key(raw_spec_args, dns_args, raw_const_args)
 
         entry_key = self.key(spec_args, dns_args, const_args)
         # CPU has one device per process and `current_device()` returns the
@@ -2472,27 +2552,51 @@ class LibEntry(triton.KernelInterface):
             cache = self._cpu_cache
         else:
             cache = self.kernel_cache[device]
-        if bucketing_active and all_named_args is not None and entry_key in cache:
-            _, _, cached_tune_constexprs, cached_heur_constexprs, _ = cache[entry_key]
+        if bucketing_active and all_named_args is not None:
             policy, _, heuristics_nodes = self._get_bucketing_meta()
-            if heuristics_nodes and cached_heur_constexprs:
+            def _post_heur_match(cand_key, allow_raw_match=False):
+                _, _, c_tune, c_heur, _ = cache[cand_key]
+                if not (heuristics_nodes and c_heur):
+                    return True, None
                 from triton.runtime.shape_bucketing import evaluate_heuristics_for_bucketing
                 actual_heur = {}
-                merged_post = {**all_named_args, **cached_tune_constexprs}
+                merged_post = {**all_named_args, **c_tune}
                 try:
                     for h_node in reversed(heuristics_nodes):
                         h_node._ft_bucket_policy = policy
-                        evaluated = evaluate_heuristics_for_bucketing(
-                            h_node.values, merged_post, policy
-                        )
-                        merged_post.update(evaluated)
-                        actual_heur.update(evaluated)
+                        ev = evaluate_heuristics_for_bucketing(h_node.values, merged_post, policy)
+                        merged_post.update(ev)
+                        actual_heur.update(ev)
                 except Exception:
-                    actual_heur = cached_heur_constexprs
-                if actual_heur != cached_heur_constexprs:
+                    actual_heur = c_heur
+                if actual_heur == c_heur:
+                    return True, actual_heur
+                if allow_raw_match:
+                    raw_heur = {}
+                    raw_post = {**all_named_args, **c_tune}
+                    try:
+                        for h_node in reversed(heuristics_nodes):
+                            for hk, hfn in h_node.values.items():
+                                rv = hfn(raw_post)
+                                raw_post[hk] = rv
+                                raw_heur[hk] = rv
+                    except Exception:
+                        raw_heur = None
+                    if raw_heur == c_heur:
+                        return True, raw_heur
+                return False, actual_heur
+
+            if entry_key in cache:
+                ok_h, act_h = _post_heur_match(entry_key, allow_raw_match=True)
+                if not ok_h:
                     entry_key = entry_key + (
-                        ("ft_post_heur", tuple(sorted(actual_heur.items()))),
+                        ("ft_post_heur", tuple(sorted(act_h.items()))),
                     )
+            if entry_key not in cache and raw_entry_key is not None and raw_entry_key in cache:
+                ok_raw, _ = _post_heur_match(raw_entry_key, allow_raw_match=True)
+                if ok_raw:
+                    entry_key = raw_entry_key
+                    used_raw_entry = True
         _entry_coordinated = False
         if entry_key not in cache:
             _entry_guard = self._resolve_dispatch_guard() if guard_enabled else None
@@ -2504,7 +2608,35 @@ class LibEntry(triton.KernelInterface):
                     with self.lock:
                         if entry_key in cache:
                             break
-                        kernel = self._first_run(*args, **kwargs)
+                        jf = self.jit_function
+                        prev_force = getattr(jf, "_bkt_force_unaligned_indices", None)
+                        prev_in_le = getattr(jf, "_bkt_in_libentry_miss", False)
+                        if bucketing_active:
+                            jf._bkt_force_unaligned_indices = stripped_jit_indices or None
+                            jf._bkt_in_libentry_miss = True
+                        try:
+                            kernel = self._first_run(*args, **kwargs)
+                        finally:
+                            if bucketing_active:
+                                jf._bkt_force_unaligned_indices = prev_force
+                                jf._bkt_in_libentry_miss = prev_in_le
+                        # Soundness gate: if JITFunction reused an already-compiled
+                        # aligned binary (0-recompile cache-first hit) or kernel still
+                        # carries tt.divisibility on a stripped axis, store under
+                        # raw_entry_key so unaligned calls can NEVER hit it.
+                        used_exact_aligned = bool(
+                            bucketing_active
+                            and (
+                                getattr(jf, "_bkt_last_run_used_exact_aligned", False)
+                                or (
+                                    stripped_jit_indices
+                                    and self._kernel_has_divisibility_on(kernel, stripped_jit_indices)
+                                )
+                            )
+                        )
+                        if used_exact_aligned and raw_entry_key is not None:
+                            entry_key = raw_entry_key
+                            used_raw_entry = True
                         fn = self.fn
                         # collect constexpr arguments for grid computation
                         constexprs = {}
@@ -2531,10 +2663,17 @@ class LibEntry(triton.KernelInterface):
                                     **constexprs,
                                 }
                                 if bucketing_active and bkt_policy is not None:
-                                    from triton.runtime.shape_bucketing import evaluate_heuristics_for_bucketing
-                                    evaluated = evaluate_heuristics_for_bucketing(
-                                        fn.values, h_env, bkt_policy
-                                    )
+                                    last_ev = getattr(fn, "_ft_last_eval", None)
+                                    if last_ev is not None:
+                                        evaluated = dict(last_ev)
+                                        if getattr(fn, "_ft_last_used_raw", False) and raw_entry_key is not None:
+                                            entry_key = raw_entry_key
+                                            used_raw_entry = True
+                                    else:
+                                        from triton.runtime.shape_bucketing import evaluate_heuristics_for_bucketing
+                                        evaluated = evaluate_heuristics_for_bucketing(
+                                            fn.values, h_env, bkt_policy
+                                        )
                                     heur_constexprs.update(evaluated)
                                     constexprs.update(evaluated)
                                 else:
@@ -2570,10 +2709,33 @@ class LibEntry(triton.KernelInterface):
                                 self._ft_entry_cache_budget = budget
                             budget.touch_and_evict(cache, entry_key, max_entries=max_bkt)
                         if l0_key is not None:
-                            if bkt_l0_key is None:
-                                bkt_l0_key = self._build_bkt_l0_bucket_key(device, args, kwargs)
+                            store_bkt_l0 = None
+                            if not used_raw_entry:
+                                store_bkt_l0 = bkt_l0_key
+                                if store_bkt_l0 is None:
+                                    store_bkt_l0 = self._build_bkt_l0_bucket_key(device, args, kwargs)
+                                if store_bkt_l0 is not None:
+                                    # Verify no aligned-compiled arg was stripped in store_bkt_l0
+                                    for _i in self.specialize_indices:
+                                        if (
+                                            _i < len(args)
+                                            and type(args[_i]) is int
+                                            and args[_i] > 1
+                                            and (args[_i] % self.divisibility) == 0
+                                        ):
+                                            _tok = store_bkt_l0[4 + _i] if (4 + _i) < len(store_bkt_l0) else None
+                                            if (
+                                                isinstance(_tok, tuple)
+                                                and len(_tok) >= 4
+                                                and isinstance(_tok[0], str)
+                                                and _tok[0].startswith("ft_")
+                                                and _tok[-2] is False
+                                            ):
+                                                if _i not in stripped_jit_indices:
+                                                    store_bkt_l0 = None
+                                                    break
                             self._store_bkt_l0_entry(
-                                l0_key, entry_key, cache[entry_key], len(args), kwargs, bkt_l0_key=bkt_l0_key
+                                l0_key, entry_key, cache[entry_key], len(args), kwargs, bkt_l0_key=store_bkt_l0
                             )
                     return kernel, constexprs
 
@@ -2582,9 +2744,28 @@ class LibEntry(triton.KernelInterface):
 
         entry = cache[entry_key]
         if bucketing_active and l0_key is not None:
-            if bkt_l0_key is None:
-                bkt_l0_key = self._build_bkt_l0_bucket_key(device, args, kwargs)
-            self._store_bkt_l0_entry(l0_key, entry_key, entry, len(args), kwargs, bkt_l0_key=bkt_l0_key)
+            store_bkt_l0 = None
+            if not used_raw_entry:
+                store_bkt_l0 = bkt_l0_key
+                if store_bkt_l0 is None:
+                    store_bkt_l0 = self._build_bkt_l0_bucket_key(device, args, kwargs)
+                if store_bkt_l0 is not None and self._kernel_has_divisibility_on(
+                    entry[0],
+                    {
+                        _i for _i in self.specialize_indices
+                        if _i < len(args)
+                        and type(args[_i]) is int
+                        and args[_i] > 1
+                        and (args[_i] % self.divisibility) == 0
+                        and isinstance(store_bkt_l0[4 + _i] if (4 + _i) < len(store_bkt_l0) else None, tuple)
+                        and len(store_bkt_l0[4 + _i]) >= 4
+                        and isinstance(store_bkt_l0[4 + _i][0], str)
+                        and store_bkt_l0[4 + _i][0].startswith("ft_")
+                        and store_bkt_l0[4 + _i][-2] is False
+                    },
+                ):
+                    store_bkt_l0 = None
+            self._store_bkt_l0_entry(l0_key, entry_key, entry, len(args), kwargs, bkt_l0_key=store_bkt_l0)
         (
             kernel,
             constexprs,

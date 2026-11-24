@@ -2,6 +2,28 @@
 
 All notable F09 dynamic shape-bucketing changes on top of upstream FlagGems `master` (`4d3d9f70`).
 
+## [v0.3.1-f09] — 2026-11-23
+
+### LibEntry Alignment Contract & Raw-Key Preservation (`fix/f09-v031-libentry-alignment-contract`)
+- **Cross-Layer Alignment Soundness (`src/flag_gems/utils/libentry.py`)**:
+  - Paired with FlagTree **`v0.3.1-f09`** (`5eac2a352a`): tracked all specialized integer indices whose
+    aligned runtime values are normalized to `is_aligned=False` (`stripped_jit_indices`), including exact
+    `ft_tune_stride` `raw_tok` restoration for `raw_entry_key`.
+  - Preserved already-compiled aligned/raw entries on cache miss via `raw_entry_key` + raw-heuristic matching
+    (zero recompile on recurring aligned static axes) without publishing aligned-only binaries into unaligned L0
+    bucket slots.
+  - Synchronized `_bkt_force_unaligned_indices` to `JITFunction` under `self.lock` during cold compilation and
+    added a dual post-compile soundness gate (`_bkt_last_run_used_exact_aligned` + `kernel.src.attrs`
+    `tt.divisibility` check) so an aligned binary can never be cached under an unaligned-compatible entry key.
+- **Verification**:
+  - Unit tests: `tests/test_libentry_shape_bucketing.py` **`14/14 PASSED`** (including new
+    `test_v031_alignment_contract_and_raw_key_fallback`); `check_bucketing_compliance.py` `0`
+    `op_level_bucketing_branch` across `generic_ops`, `fused`, and `backend:_thead`.
+  - Large-scale 656-model `x-benchmark v4` PPU-ZW810E validation (`75/75` affected-model clean sweep: `59/59`
+    alignment launch failures resolved, `13/13` numerical corruptions restored to `cos=0.999998–1.000000`, `2/2`
+    abnormal OOMs resolved; pure V3 69-model `PASS` subset `cold_gmean=1.666x`, `rest_gmean=3.295x`,
+    `steady_gmean=1.116x`, `.hgbin -50.3%`).
+
 ## [v0.3.0-f09] — 2026-11-23
 
 ### Installer Sync & Release Notes (`fix/f09-v030-installer-and-docs`)
