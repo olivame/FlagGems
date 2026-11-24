@@ -233,6 +233,15 @@ class FunctionSchema:
         return self.signature(outputs_in_arg=False)
 
 
+def _use_dynamic_outer_shape() -> bool:
+    try:
+        from flag_gems.utils.pointwise_dynamic import use_dynamic_pointwise_shapes
+
+        return bool(use_dynamic_pointwise_shapes())
+    except Exception:
+        return False
+
+
 class KernelGenerator:
     def __init__(
         self,
@@ -241,12 +250,14 @@ class KernelGenerator:
         rank: int,
         name: str,
         config: CodeGenConfig,
+        dynamic_shape: bool = False,
     ):
         self.fx = function_schema
         self.fn = scalar_fn
         self.ndim = rank
         self.name = name
         self.config = config
+        self.dynamic_shape = dynamic_shape
 
         self.fn_name = scalar_fn.__name__
         self.fn_module = scalar_fn.__module__
@@ -260,8 +271,10 @@ class KernelGenerator:
     def gen_decorators(self, code):
         code.writeline("@libentry()")
         num_non_tensor_args = self.fx.num_non_tensor_args()
-        if num_non_tensor_args > 0:
-            non_specialize_arg_names = [f"val{i}" for i in range(num_non_tensor_args)]
+        non_specialize_arg_names = [f"val{i}" for i in range(num_non_tensor_args)]
+        if self.dynamic_shape and self.ndim > 0:
+            non_specialize_arg_names.extend(["s0", "num_tasks"])
+        if non_specialize_arg_names:
             code.writeline(f"@triton.jit(do_not_specialize={non_specialize_arg_names})")
         else:
             code.writeline("@triton.jit")
@@ -330,10 +343,14 @@ class KernelGenerator:
                             f"{stride_order_args}, # stride order for out{i}"
                         )
 
-                task_space_args = _cs(f"s{i}: tl.constexpr" for i in range(ndim))
+                task_space_args = _cs(
+                    f"s{i}: {'int' if (self.dynamic_shape and i == 0) else 'tl.constexpr'}"
+                    for i in range(ndim)
+                )
                 code.writeline(f"{task_space_args}, # task_space")
 
-                code.writeline("num_tasks: tl.constexpr,")
+                num_tasks_ty = "int" if self.dynamic_shape else "tl.constexpr"
+                code.writeline(f"num_tasks: {num_tasks_ty},")
 
             if ndim > 0:
                 code.writeline("tiles_per_cta: tl.constexpr,")
@@ -385,10 +402,14 @@ class KernelGenerator:
                     )
                     code.writeline(f"{stride_args}, # strides for out{i}")
 
-                task_space_args = _cs(f"s{i}: tl.constexpr" for i in range(ndim))
+                task_space_args = _cs(
+                    f"s{i}: {'int' if (self.dynamic_shape and i == 0) else 'tl.constexpr'}"
+                    for i in range(ndim)
+                )
                 code.writeline(f"{task_space_args}, # task_space")
 
-                code.writeline("num_tasks: tl.constexpr,")
+                num_tasks_ty = "int" if self.dynamic_shape else "tl.constexpr"
+                code.writeline(f"num_tasks: {num_tasks_ty},")
 
             if ndim > 0:
                 code.writeline("tiles_per_cta: tl.constexpr,")
@@ -1090,13 +1111,20 @@ class ModuleGenerator:
         jit_fn_name: str,
         wrapper_name: str,
         config: CodeGenConfig,
+        dynamic_shape: bool = False,
     ):
         self.config = config
+        self.dynamic_shape = dynamic_shape
         self.wrapper_gen = WrapperGenerator(
             function_schema, jit_fn_name, ndim, wrapper_name, config
         )
         self.kernel_gen = KernelGenerator(
-            function_schema, scalar_fn, ndim, jit_fn_name, config
+            function_schema,
+            scalar_fn,
+            ndim,
+            jit_fn_name,
+            config,
+            dynamic_shape=dynamic_shape,
         )
 
     @staticmethod
@@ -1284,8 +1312,10 @@ class PointwiseDynamicFunction:
         return tuple(item.unwrap() for item in tensors)
 
     def instantiate(self, ndim):
-        if ndim in self.overloads:
-            return self.overloads[ndim]
+        dynamic_shape = _use_dynamic_outer_shape()
+        cache_key = (ndim, dynamic_shape)
+        if cache_key in self.overloads:
+            return self.overloads[cache_key]
 
         code = IndentedBuffer()
 
@@ -1299,6 +1329,7 @@ class PointwiseDynamicFunction:
             kernel_name,
             wrapper_name,
             self.config,
+            dynamic_shape=dynamic_shape,
         )
         module_gen.codegen(code)
 
@@ -1306,6 +1337,7 @@ class PointwiseDynamicFunction:
             f"pointwise_dynamic_{self._scalar_fn_cache_key}_{kernel_name}_"
             f"{'1d_tile_' if self.config.prefer_1d_tile else ''}"
             f"{'bptr_' if (not self.config.prefer_1d_tile and self.config.prefer_block_pointer) else ''}"
+            f"{'dyn_' if dynamic_shape else ''}"
             f"pid_{self.pid}.py"
         )
         with open(code_cache_dir() / file_name, "wt", encoding="utf-8") as f:
@@ -1322,7 +1354,7 @@ class PointwiseDynamicFunction:
         m.__dict__[self._scalar_fn.__name__] = self._scalar_fn
 
         overload = getattr(m, wrapper_name)
-        self.overloads[ndim] = overload
+        self.overloads[cache_key] = overload
         return overload
 
 

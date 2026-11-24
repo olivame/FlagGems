@@ -2,6 +2,26 @@
 
 All notable F09 dynamic shape-bucketing changes on top of upstream FlagGems `master` (`4d3d9f70`).
 
+## [v0.3.2-f09] — 2026-11-24
+
+### Declarative Static-Grid Hot-Path & Kunlunxin Dynamic Pointwise (`feat/f09-v032-xpu-port-and-hotpath-cache`)
+- **Declarative Capability Dispatch (`src/flag_gems/utils/libentry.py`)**:
+  - Replaced `_is_xpu_static_grid_backend` with declarative `_get_static_grid_caps()` / `_baked_grid_key_part()`
+    driven by `triton.runtime.backend_caps.get_backend_capabilities`.
+  - Hoisted `get_backend_capabilities` import to module load time and merged double capability checks into a
+    single lookup per launch, eliminating per-launch import-hook interception and redundant env lookups on the
+    L0 fast path across all backends.
+- **Bucketing-Gated Kunlunxin Pointwise (`src/flag_gems/runtime/backend/_kunlunxin/utils/pointwise_dynamic.py`)**:
+  - Strictly gated on `triton.knobs.autotuning.shape_bucketing=True` (zero change on `OFF` path; isolated by
+    `(ndim, dynamic_shape)` cache key and `dyn_` filename): preserves native `one_tile_per_cta=True` and
+    `tl.constexpr` inner dims/strides while parameterizing outer `s0` and `num_tasks` as runtime `int`.
+- **Verification**:
+  - Unit tests: `tests/test_libentry_shape_bucketing.py` **`14/14 PASSED`** (paired with FlagTree `62/62`).
+  - Kunlunxin P800 62-model evaluation (`40/48 = 83.3%` ATen-loadable PASS, `0` ON-only regressions,
+    `cold_gmean=1.765x`, `rest_gmean=2.016x`, `.xpubin -45.93%`, `cos(ON,OFF) >= 0.999989`); hot-path cache fix
+    recovered steady-state geomean on the 6 slowest tail models from `0.951x` -> **`1.015x` (batched) / `1.028x`
+    (per-step)** with `max_abs=0.0`.
+
 ## [v0.3.1-f09] — 2026-11-23
 
 ### LibEntry Alignment Contract & Raw-Key Preservation (`fix/f09-v031-libentry-alignment-contract`)

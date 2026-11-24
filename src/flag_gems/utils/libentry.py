@@ -161,55 +161,69 @@ def _coordinate_dispatch_guard(guard: Any, is_cold_miss: bool):
         guard.post_compile_sync(decision)
 
 
-_STATIC_GRID_CACHE: Dict[Tuple[str, str, str, Optional[str]], bool] = {}
+try:
+    from triton.runtime.backend_caps import (
+        get_backend_capabilities as _triton_get_backend_capabilities,
+    )
+except Exception:
+    _triton_get_backend_capabilities = None
 
 
-def _is_xpu_static_grid_backend() -> bool:
-    """Return True when the active backend bakes non-callable launch grids into compiled binaries."""
+def _get_static_grid_caps() -> Any:
+    """Query declarative BackendBucketingCapabilities for the active backend."""
+    getter = _triton_get_backend_capabilities
+    if getter is None:
+        return None
     vendor_mod = getattr(_state, "vendor_module", None)
     vendor_info = getattr(vendor_mod, "vendor_info", None)
     vname = getattr(vendor_info, "vendor_name", "") or None
-    cache_key = (
-        os.environ.get("FLAGTREE_BACKEND", ""),
-        os.environ.get("TRITON_BACKEND", ""),
-        os.environ.get("FLAGTREE_BAKES_STATIC_GRID", ""),
-        vname,
-    )
-    cached = _STATIC_GRID_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
     try:
-        from triton.runtime.backend_caps import get_backend_capabilities
-        res = bool(get_backend_capabilities(vendor_name=vname).bakes_static_grid)
+        return getter(vendor_name=vname)
     except Exception:
-        res = (
-            cache_key[0].lower() == "xpu"
-            or cache_key[1].lower() == "xpu"
-            or vname == "kunlunxin"
-        )
-    _STATIC_GRID_CACHE[cache_key] = res
-    return res
+        return None
+
+
+def _bakes_static_grid_backend() -> bool:
+    """Return True when the active backend bakes static launch grids."""
+    caps = _get_static_grid_caps()
+    return bool(getattr(caps, "bakes_static_grid", False))
 
 
 def _supports_cudagraph_bench(vendor_name: Optional[str] = None) -> bool:
     """Query BackendBucketingCapabilities for CUDA-graph benchmark support."""
+    getter = _triton_get_backend_capabilities
+    if getter is None:
+        return True
     try:
-        from triton.runtime.backend_caps import get_backend_capabilities
-
-        if vendor_name:
-            caps = get_backend_capabilities(backend=vendor_name)
-        else:
-            caps = get_backend_capabilities()
+        caps = getter(backend=vendor_name) if vendor_name else getter()
         return bool(getattr(caps, "supports_cudagraph_bench", True))
     except Exception:
         return True
 
 
-def _canonicalize_static_grid(grid: Any) -> Tuple[Any, ...]:
+def _canonicalize_static_grid(grid: Any, caps: Any = None) -> Tuple[Any, ...]:
+    """Collapse a static launch grid using backend capability rules."""
+    if caps is None:
+        caps = _get_static_grid_caps()
+    canon_fn = getattr(caps, "canonicalize_compile_grid", None)
+    if callable(canon_fn):
+        res = canon_fn(grid)
+        if res is not None:
+            return res if isinstance(res, tuple) else (res,)
     try:
         return tuple(int(x) for x in grid)
     except Exception:
         return (grid,) if not isinstance(grid, (tuple, list)) else tuple(grid)
+
+
+def _baked_grid_key_part(grid: Any) -> Optional[Tuple[str, Tuple[Any, ...]]]:
+    """Return ('baked_grid', canonical_grid) via one capability lookup, or None."""
+    if grid is None or callable(grid):
+        return None
+    caps = _get_static_grid_caps()
+    if not getattr(caps, "bakes_static_grid", False):
+        return None
+    return ("baked_grid", _canonicalize_static_grid(grid, caps=caps))
 
 from types import SimpleNamespace
 
@@ -2257,9 +2271,9 @@ class LibEntry(triton.KernelInterface):
                     parts.append((k, v.dtype, (v.data_ptr() % div) == 0))
                 else:
                     return None
-        raw_grid = kwargs.get("grid")
-        if raw_grid is not None and not callable(raw_grid) and _is_xpu_static_grid_backend():
-            parts.append(("xpu_grid", _canonicalize_static_grid(raw_grid)))
+        baked_g = _baked_grid_key_part(kwargs.get("grid"))
+        if baked_g is not None:
+            parts.append(baked_g)
         return tuple(parts)
 
     def _get_bkt_l0_lock(self):
@@ -2352,9 +2366,9 @@ class LibEntry(triton.KernelInterface):
                     parts.append((k, v.dtype, (v.data_ptr() % div) == 0))
                 else:
                     return None
-        raw_grid = kwargs.get("grid")
-        if raw_grid is not None and not callable(raw_grid) and _is_xpu_static_grid_backend():
-            parts.append(("xpu_grid", _canonicalize_static_grid(raw_grid)))
+        baked_g = _baked_grid_key_part(kwargs.get("grid"))
+        if baked_g is not None:
+            parts.append(baked_g)
         return tuple(parts)
 
     def _promote_bkt_l0_hit(self, l0_key, saved):
@@ -2535,11 +2549,11 @@ class LibEntry(triton.KernelInterface):
             stripped_jit_indices, raw_spec_args, raw_const_args = self._normalize_spec_and_heur_for_key(
                 spec_names, spec_args, const_args, all_named_args
             )
-            if not callable(grid) and _is_xpu_static_grid_backend():
-                xpu_g = ("xpu_baked_grid", _canonicalize_static_grid(grid))
-                const_args.append(xpu_g)
+            baked_g = _baked_grid_key_part(grid)
+            if baked_g is not None:
+                const_args.append(baked_g)
                 if raw_const_args is not None:
-                    raw_const_args.append(xpu_g)
+                    raw_const_args.append(baked_g)
             if raw_spec_args is not None and raw_const_args is not None:
                 raw_entry_key = self.key(raw_spec_args, dns_args, raw_const_args)
 
@@ -2907,9 +2921,9 @@ class LibEntry(triton.KernelInterface):
             self._normalize_spec_and_heur_for_key(
                 spec_names, keys[1], keys[0], all_named_args
             )
-            raw_grid = kwargs.get("grid")
-            if raw_grid is not None and not callable(raw_grid) and _is_xpu_static_grid_backend():
-                keys[0].append(("xpu_baked_grid", _canonicalize_static_grid(raw_grid)))
+            baked_g = _baked_grid_key_part(kwargs.get("grid"))
+            if baked_g is not None:
+                keys[0].append(baked_g)
         # Generic order is specialized, unspecialized, then constexpr values.
         entry_key = self.key(keys[1], keys[2], keys[0])
         device_index = torch_device_fn.current_device()

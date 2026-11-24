@@ -267,6 +267,11 @@ def _is_shape_bucketing_enabled() -> bool:
     return bool(autotuning is not None and getattr(autotuning, "shape_bucketing", False))
 
 
+def use_dynamic_pointwise_shapes() -> bool:
+    """Return True when pointwise codegen should emit dynamic runtime shape parameters."""
+    return _is_shape_bucketing_enabled()
+
+
 class KernelGenerator:
     def __init__(
         self,

@@ -498,17 +498,19 @@ class TestLibEntryFlagTreeBucketing(unittest.TestCase):
                 triton.knobs.autotuning.adjust_block_size = False
 
                 for cache_binding in (True, False):
-                    # Static tuple grids are baked into xpubin on XPU -> distinct cache keys
+                    # Non-specialized dynamic tuple grids collapse to (1,1,1) -> bucket reuse
+                    # Specialized interleave grid (12,1,1) stays isolated -> 2 compiled bins
                     jit_static = _FakeJIT(row_src)
                     e_static = _build_synthetic_libentry(
                         jit_static, jit_static, cache_binding=cache_binding
                     )
                     e_static.run(x_t, y_t, 277, 128, BLOCK_N=128, grid=(277, 1, 1))
-                    e_static.run(x_t, y_t, 277, 128, BLOCK_N=128, grid=(277, 1, 1))
                     e_static.run(x_t, y_t, 291, 128, BLOCK_N=128, grid=(291, 1, 1))
+                    self.assertEqual(len(jit_static.compiled_kernels), 1)
+                    e_static.run(x_t, y_t, 12, 128, BLOCK_N=128, grid=(12, 1, 1))
                     self.assertEqual(len(jit_static.compiled_kernels), 2)
 
-                    # Callable grids remain dynamic at launch on XPU -> bucket reuse across 277 & 291
+                    # Callable grids remain dynamic at launch -> bucket reuse across 277 & 291
                     jit_dyn = _FakeJIT(row_src)
                     e_dyn = _build_synthetic_libentry(
                         jit_dyn, jit_dyn, cache_binding=cache_binding
